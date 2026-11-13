@@ -144,9 +144,21 @@ class Tensor:
         
 
     def __neg__(self) -> Tensor:
-        from houssem_torch.backends.cpu import kernels as cpu
-        return Tensor(_storage=cpu.negate(self._storage),
-                      device=self.device, dtype=self.dtype)
+        from houssem_torch.ops.pointwise import negate
+        return negate(self)
+
+    @property
+    def is_leaf(self) -> bool:
+        return self._grad_fn is None
+
+    def detach(self) -> Tensor:
+        """Same storage, no graph history."""
+        return Tensor(_storage=self._storage, device=self.device, dtype=self.dtype)
+
+    def backward(self, grad=None) -> None:
+        from houssem_torch.autograd.engine import backward
+        backward(self, grad)
+        
 
     def __matmul__(self, other) -> Tensor:
         from houssem_torch.ops.linalg import matmul

@@ -1,6 +1,8 @@
 from __future__ import annotations
 import numpy as np
-from houssem_torch.dtypes import float32
+from houssem_torch.autograd.function import record
+from houssem_torch.autograd import functions as F
+from houssem_torch.fusion.engine import try_fuse
 
 
 def _wrap(storage, ref_tensor):
@@ -20,45 +22,55 @@ def _coerce(other, ref_tensor):
                   device=ref_tensor.device, dtype=ref_tensor.dtype)
 
 
-def add(a, b):
+def _pair(a, b):
+    if not hasattr(b, '_storage'):
+        b = _coerce(b, a)
+    if not hasattr(a, '_storage'):
+        a = _coerce(a, b)
+    return a, b
+
+
+def _compute(op, *tensors):
+    fused = try_fuse(op, *tensors)
+    if fused is not None:
+        return fused
+
     from houssem_torch.backends.cpu import kernels as cpu
-    b = _coerce(b, a)
-    return _wrap(cpu.add(a._storage, b._storage), a)
+    storages = tuple(tensor._storage for tensor in tensors)
+    return getattr(cpu, op)(*storages)
+
+
+def add(a, b):
+    a, b = _pair(a, b)
+    return record(_wrap(_compute("add", a, b), a), F.AddBackward, a, b)
 
 
 def subtract(a, b):
-    from houssem_torch.backends.cpu import kernels as cpu
-    if not hasattr(b, '_storage'):
-        b = _coerce(b, a)
-    if not hasattr(a, '_storage'):
-        a = _coerce(a, b)
-    return _wrap(cpu.subtract(a._storage, b._storage), a)
+    a, b = _pair(a, b)
+    return record(_wrap(_compute("subtract", a, b), a), F.SubBackward, a, b)
 
 
 def multiply(a, b):
-    from houssem_torch.backends.cpu import kernels as cpu
-    b = _coerce(b, a)
-    return _wrap(cpu.multiply(a._storage, b._storage), a)
+    a, b = _pair(a, b)
+    return record(_wrap(_compute("multiply", a, b), a), F.MulBackward, a, b)
 
 
 def divide(a, b):
-    from houssem_torch.backends.cpu import kernels as cpu
-    if not hasattr(b, '_storage'):
-        b = _coerce(b, a)
-    if not hasattr(a, '_storage'):
-        a = _coerce(a, b)
-    return _wrap(cpu.divide(a._storage, b._storage), a)
+    a, b = _pair(a, b)
+    return record(_wrap(_compute("divide", a, b), a), F.DivBackward, a, b)
+
+
+def negate(a):
+    return record(_wrap(_compute("negate", a), a), F.NegBackward, a)
+
 
 def relu(a):
-    from houssem_torch.backends.cpu import kernels as cpu
-    return _wrap(cpu.relu(a._storage), a)
+    return record(_wrap(_compute("relu", a), a), F.ReluBackward, a)
 
 
 def exp(a):
-    from houssem_torch.backends.cpu import kernels as cpu
-    return _wrap(cpu.exp(a._storage), a)
+    return record(_wrap(_compute("exp", a), a), F.ExpBackward, a)
 
 
 def log(a):
-    from houssem_torch.backends.cpu import kernels as cpu
-    return _wrap(cpu.log(a._storage), a)
+    return record(_wrap(_compute("log", a), a), F.LogBackward, a)

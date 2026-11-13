@@ -15,8 +15,7 @@ class CPUStorage:
     """Owns the raw NumPy array for a CPU tensor."""
 
     def __init__(self, data: np.ndarray):
-        assert isinstance(data, np.ndarray), f"Expected np.ndarray, got {type(data)}"
-        self._array = data
+        self._array = np.asarray(data)
 
     @property
     def array(self) -> np.ndarray:

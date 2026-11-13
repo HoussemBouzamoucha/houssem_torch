@@ -47,6 +47,6 @@ def randn(shape: ShapeLike, dtype: DType = float32,
 
 
 def tensor(data, dtype: DType = float32,
-           device: Union[Device, str] = "cpu"):
+           device: Union[Device, str] = "cpu", requires_grad: bool = False):
     from houssem_torch.tensor import Tensor
-    return Tensor(data, device=device, dtype=dtype)
+    return Tensor(data, device=device, dtype=dtype, requires_grad=requires_grad)

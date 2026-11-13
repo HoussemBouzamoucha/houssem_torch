@@ -1,4 +1,6 @@
 from __future__ import annotations
+from houssem_torch.autograd.function import record
+from houssem_torch.autograd import functions as F
 
 
 def _wrap(storage, ref_tensor):
@@ -18,4 +20,5 @@ def matmul(a, b):
         raise ValueError(
             f"matmul shape mismatch: {a.shape} @ {b.shape}."
         )
-    return _wrap(cpu.matmul(a._storage, b._storage), a)
+    out = _wrap(cpu.matmul(a._storage, b._storage), a)
+    return record(out, F.MatmulBackward, a, b)

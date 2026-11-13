@@ -8,6 +8,11 @@ from houssem_torch.tensor import Tensor
 from houssem_torch.device import Device
 from houssem_torch.dtypes import float32, int64
 
+from houssem_torch.autograd import no_grad
+from houssem_torch.parameter import Parameter
+from houssem_torch.fusion import fusion_mode
+
+
 from houssem_torch.ops.creation import (
     zeros, ones, full, arange, randn, tensor
 )
@@ -26,4 +31,6 @@ __all__ = [
     "sum", "mean", "max", "min",
     # linalg
     "matmul",
+    "fusion_mode",
 ]
+
