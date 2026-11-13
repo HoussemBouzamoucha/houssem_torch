@@ -1,0 +1,61 @@
+import os, time, statistics
+
+# Pin thread counts BEFORE importing numpy/torch so the comparison is fair.
+N_THREADS = int(os.environ.get("BENCH_THREADS", "1"))
+for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ[var] = str(N_THREADS)
+
+import numpy as np
+import torch
+import houssem_torch as ht
+
+torch.set_num_threads(N_THREADS)
+
+
+def bench(fn, repeat=50, warmup=5):
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return statistics.median(times) * 1e3, min(times) * 1e3  # ms
+
+
+def case(name, fn_ht, fn_torch, fn_np, repeat=50):
+    med_ht, min_ht = bench(fn_ht, repeat)
+    med_pt, min_pt = bench(fn_torch, repeat)
+    med_np, min_np = bench(fn_np, repeat)
+    print(f"{name:<26}{med_ht:>10.4f}{med_np:>10.4f}{med_pt:>10.4f}"
+          f"{med_ht/med_np:>9.2f}x{med_ht/med_pt:>9.2f}x"
+          f"   (min: {min_ht:.4f}/{min_np:.4f}/{min_pt:.4f})")
+
+
+def main():
+    rng = np.random.default_rng(0)
+    print(f"threads = {N_THREADS}, torch {torch.__version__}, numpy {np.__version__}\n")
+    print(f"{'op':<26}{'ht (ms)':>10}{'np (ms)':>10}{'torch':>10}{'ht/np':>10}{'ht/torch':>10}")
+    print("-" * 76)
+
+    for n in (64, 1024, 4096):
+        a_np = rng.standard_normal((n, n), dtype=np.float32)
+        b_np = rng.standard_normal((n, n), dtype=np.float32)
+        a_h, b_h = ht.tensor(a_np), ht.tensor(b_np)
+        a_t, b_t = torch.from_numpy(a_np.copy()), torch.from_numpy(b_np.copy())
+        rep = 200 if n <= 64 else 30 if n <= 1024 else 20
+        tag = f"[{n}x{n}]"
+
+        case(f"add {tag}",        lambda: a_h + b_h,       lambda: a_t + b_t,         lambda: a_np + b_np, rep)
+        case(f"multiply {tag}",   lambda: a_h * b_h,       lambda: a_t * b_t,         lambda: a_np * b_np, rep)
+        case(f"exp {tag}",        lambda: ht.exp(a_h),     lambda: torch.exp(a_t),    lambda: np.exp(a_np), rep)
+        case(f"relu {tag}",       lambda: ht.relu(a_h),    lambda: torch.relu(a_t),   lambda: np.maximum(a_np, 0), rep)
+        case(f"sum {tag}",        lambda: a_h.sum(),       lambda: a_t.sum(),         lambda: a_np.sum(), rep)
+        case(f"sum axis=0 {tag}", lambda: a_h.sum(axis=0), lambda: a_t.sum(dim=0),    lambda: a_np.sum(axis=0), rep)
+        case(f"transpose {tag}",  lambda: a_h.transpose(), lambda: a_t.t(),           lambda: a_np.T, rep)
+        case(f"matmul {tag}",     lambda: a_h @ b_h,       lambda: a_t @ b_t,         lambda: a_np @ b_np, max(3, rep // 3))
+        print()
+
+
+if __name__ == "__main__":
+    main()
