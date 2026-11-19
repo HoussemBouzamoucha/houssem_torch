@@ -1,10 +1,12 @@
 import ctypes
+import gc
 import os
 from pathlib import Path
 import shutil
 import statistics
 import subprocess
 import time
+import tracemalloc
 
 THREADS = int(os.environ.get("BENCH_THREADS", "1"))
 WARMUP = int(os.environ.get("BENCH_WARMUP", "2"))
@@ -23,7 +25,9 @@ FOLDER = Path(__file__).resolve().parent
 SOURCE = FOLDER / "fused_kernel.cpp"
 LIBRARY = FOLDER / "build" / "fusion_kernel.dll"
 SIZES = (64, 256, 1024, 4096, 16384, 65536)
+OMP_THREAD_COUNTS = (1, 2, 4, 6)
 FLOAT_POINTER = ctypes.POINTER(ctypes.c_float)
+SIZE_ARG = ctypes.c_size_t
 
 
 def build_library():
@@ -38,7 +42,7 @@ def build_library():
             compiler,
             "-std=c++17",
             "-O3",
-            "-march=native",
+            "-fopenmp",
             "-shared",
             str(SOURCE),
             "-o",
@@ -54,21 +58,39 @@ def build_library():
 
 
 def _configure_signatures(library):
-    size_arg = ctypes.c_size_t
-    library.fusion_cpp_forward.argtypes = [
-        FLOAT_POINTER, FLOAT_POINTER, FLOAT_POINTER, size_arg
+    forward_args = [FLOAT_POINTER, FLOAT_POINTER, FLOAT_POINTER, SIZE_ARG]
+    backward_args = [
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        SIZE_ARG,
     ]
-    library.fusion_cpp_forward.restype = None
-    library.fusion_cpp_backward.argtypes = [
-        FLOAT_POINTER, FLOAT_POINTER, FLOAT_POINTER, FLOAT_POINTER,
-        FLOAT_POINTER, size_arg
+    combined_args = [
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        FLOAT_POINTER,
+        SIZE_ARG,
     ]
-    library.fusion_cpp_backward.restype = None
-    library.fusion_cpp_forward_backward.argtypes = [
-        FLOAT_POINTER, FLOAT_POINTER, FLOAT_POINTER, FLOAT_POINTER,
-        FLOAT_POINTER, size_arg
-    ]
-    library.fusion_cpp_forward_backward.restype = None
+    for suffix in ("", "_omp", "_avx2"):
+        forward = getattr(library, f"fusion_cpp_forward{suffix}")
+        forward.argtypes = forward_args
+        forward.restype = None
+        backward = getattr(library, f"fusion_cpp_backward{suffix}")
+        backward.argtypes = backward_args
+        backward.restype = None
+        combined = getattr(library, f"fusion_cpp_forward_backward{suffix}")
+        combined.argtypes = combined_args
+        combined.restype = None
+    library.fusion_cpp_avx2_supported.argtypes = []
+    library.fusion_cpp_avx2_supported.restype = ctypes.c_int
+    library.fusion_cpp_openmp_enabled.argtypes = []
+    library.fusion_cpp_openmp_enabled.restype = ctypes.c_int
+    library.fusion_cpp_set_threads.argtypes = [ctypes.c_int]
+    library.fusion_cpp_set_threads.restype = None
 
 
 def _pointer(array):
@@ -150,7 +172,7 @@ def _framework_case(a_data, b_data, library_name, fused=False):
     )
 
 
-def _cpp_case(library, a_data, b_data):
+def _cpp_case(library, a_data, b_data, suffix=""):
     size = a_data.size
     output = np.empty_like(a_data)
     grad_output = np.ones_like(a_data)
@@ -160,78 +182,137 @@ def _cpp_case(library, a_data, b_data):
     output_ptr = _pointer(output)
     upstream_ptr = _pointer(grad_output)
     grad_a_ptr, grad_b_ptr = _pointer(grad_a), _pointer(grad_b)
+    forward = getattr(library, f"fusion_cpp_forward{suffix}")
+    backward = getattr(library, f"fusion_cpp_backward{suffix}")
+    combined_kernel = getattr(library, f"fusion_cpp_forward_backward{suffix}")
 
-    def forward():
-        library.fusion_cpp_forward(a_ptr, b_ptr, output_ptr, size)
+    def run_forward():
+        forward(a_ptr, b_ptr, output_ptr, size)
 
-    def backward():
-        library.fusion_cpp_backward(
-            a_ptr, b_ptr, upstream_ptr, grad_a_ptr, grad_b_ptr, size
-        )
+    def run_backward():
+        backward(a_ptr, b_ptr, upstream_ptr, grad_a_ptr, grad_b_ptr, size)
 
-    def combined():
-        library.fusion_cpp_forward_backward(
-            a_ptr, b_ptr, output_ptr, grad_a_ptr, grad_b_ptr, size
-        )
+    def run_combined():
+        combined_kernel(a_ptr, b_ptr, output_ptr, grad_a_ptr, grad_b_ptr, size)
 
-    return _median_ms(forward), _median_ms(backward), _median_ms(combined)
+    return (
+        _median_ms(run_forward),
+        _median_ms(run_backward),
+        _median_ms(run_combined),
+    )
 
 
 def _validate(library):
     rng = np.random.default_rng(42)
-    a_data = rng.standard_normal(257, dtype=np.float32)
-    b_data = rng.standard_normal(257, dtype=np.float32)
-    cpp_output = np.empty_like(a_data)
-    cpp_grad_a = np.empty_like(a_data)
-    cpp_grad_b = np.empty_like(b_data)
+    for size in (1, 7, 8, 9, 17, 257):
+        a_data = rng.standard_normal(size, dtype=np.float32)
+        b_data = rng.standard_normal(size, dtype=np.float32)
+        grad_output = rng.standard_normal(size, dtype=np.float32)
+        edge_a = np.array([-20.0, -2.0, -0.25, -0.249998, 20.0],
+                          dtype=np.float32)
+        edge_count = min(size, edge_a.size)
+        a_data[:edge_count] = edge_a[:edge_count]
+        b_data[:edge_count] = 1.0
 
-    h_a = ht.tensor(a_data, requires_grad=True)
-    h_b = ht.tensor(b_data, requires_grad=True)
+        h_a = ht.tensor(a_data, requires_grad=True)
+        h_b = ht.tensor(b_data, requires_grad=True)
+        with ht.fusion_mode(False):
+            h_output = _ht_work(h_a, h_b)
+        h_output.sum().backward()
+
+        t_a = torch.tensor(a_data, requires_grad=True)
+        t_b = torch.tensor(b_data, requires_grad=True)
+        t_output = _torch_work(t_a, t_b)
+        t_output.sum().backward()
+        np.testing.assert_allclose(h_output.numpy(), t_output.detach().numpy(),
+                                   rtol=2e-6, atol=1e-7)
+        np.testing.assert_allclose(h_a.grad.numpy(), t_a.grad.numpy(),
+                                   rtol=2e-6, atol=1e-7)
+        np.testing.assert_allclose(h_b.grad.numpy(), t_b.grad.numpy(),
+                                   rtol=2e-6, atol=1e-7)
+
+        expected_output = h_output.numpy()
+        expected_grad_a = h_a.grad.numpy()
+        expected_grad_b = h_b.grad.numpy()
+        for suffix in ("", "_omp") + (
+            ("_avx2",) if library.fusion_cpp_avx2_supported() else ()
+        ):
+            if suffix == "_omp":
+                library.fusion_cpp_set_threads(4)
+            output = np.empty_like(a_data)
+            grad_a = np.empty_like(a_data)
+            grad_b = np.empty_like(b_data)
+            forward = getattr(library, f"fusion_cpp_forward{suffix}")
+            forward(_pointer(a_data), _pointer(b_data), _pointer(output), size)
+            np.testing.assert_allclose(output, expected_output,
+                                       rtol=3e-6, atol=3e-7)
+            combined = getattr(library, f"fusion_cpp_forward_backward{suffix}")
+            combined(_pointer(a_data), _pointer(b_data), _pointer(output),
+                     _pointer(grad_a), _pointer(grad_b), size)
+            np.testing.assert_allclose(output, expected_output,
+                                       rtol=3e-6, atol=3e-7)
+            np.testing.assert_allclose(grad_a, expected_grad_a,
+                                       rtol=3e-6, atol=3e-7)
+            np.testing.assert_allclose(grad_b, expected_grad_b,
+                                       rtol=3e-6, atol=3e-7)
+
+            cpp_grad_a = np.empty_like(a_data)
+            cpp_grad_b = np.empty_like(b_data)
+            backward = getattr(library, f"fusion_cpp_backward{suffix}")
+            backward(_pointer(a_data), _pointer(b_data), _pointer(grad_output),
+                     _pointer(cpp_grad_a), _pointer(cpp_grad_b), size)
+            h_upstream = ht.tensor(grad_output)
+            h_a.grad = None
+            h_b.grad = None
+            with ht.fusion_mode(False):
+                (h_output * h_upstream).sum().backward()
+            np.testing.assert_allclose(cpp_grad_a, h_a.grad.numpy(),
+                                       rtol=3e-6, atol=3e-7)
+            np.testing.assert_allclose(cpp_grad_b, h_b.grad.numpy(),
+                                       rtol=3e-6, atol=3e-7)
+            h_a.grad = None
+            h_b.grad = None
+            h_output.sum().backward()
+
+
+def _houssem_peak_bytes(a_data, b_data):
+    gc.collect()
+    tracemalloc.start()
+    a = ht.tensor(a_data, requires_grad=True)
+    b = ht.tensor(b_data, requires_grad=True)
     with ht.fusion_mode(False):
-        h_output = _ht_work(h_a, h_b)
-    h_output.sum().backward()
-
-    library.fusion_cpp_forward_backward(
-        _pointer(a_data), _pointer(b_data), _pointer(cpp_output),
-        _pointer(cpp_grad_a), _pointer(cpp_grad_b), a_data.size
-    )
-    np.testing.assert_allclose(cpp_output, h_output.numpy(), rtol=2e-6, atol=1e-7)
-    np.testing.assert_allclose(cpp_grad_a, h_a.grad.numpy(), rtol=2e-6, atol=1e-7)
-    np.testing.assert_allclose(cpp_grad_b, h_b.grad.numpy(), rtol=2e-6, atol=1e-7)
-
-    t_a = torch.tensor(a_data, requires_grad=True)
-    t_b = torch.tensor(b_data, requires_grad=True)
-    t_output = _torch_work(t_a, t_b)
-    t_output.sum().backward()
-    np.testing.assert_allclose(cpp_output, t_output.detach().numpy(),
-                               rtol=2e-6, atol=1e-7)
-    np.testing.assert_allclose(cpp_grad_a, t_a.grad.numpy(),
-                               rtol=2e-6, atol=1e-7)
-    np.testing.assert_allclose(cpp_grad_b, t_b.grad.numpy(),
-                               rtol=2e-6, atol=1e-7)
+        result = _ht_work(a, b)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    del result, a, b
+    return peak
 
 
 def main():
     library = build_library()
+    if not library.fusion_cpp_openmp_enabled():
+        raise RuntimeError("The C++ benchmark was built without OpenMP support.")
     _validate(library)
     compiler = shutil.which("g++")
     compiler_version = subprocess.run(
         [compiler, "--version"], check=True, capture_output=True, text=True
     ).stdout.splitlines()[0]
+    has_avx2 = bool(library.fusion_cpp_avx2_supported())
     print(
-        f"C++ fused pointwise benchmark: {THREADS} thread(s), "
-        f"warmup={WARMUP}, repeats={REPEATS}\n"
+        f"C++ fused pointwise benchmark: warmup={WARMUP}, repeats={REPEATS}\n"
         f"{compiler_version}\n"
         f"NumPy {np.__version__}, Numba {numba.__version__}, "
-        f"PyTorch {torch.__version__}"
+        f"PyTorch {torch.__version__}\n"
+        f"AVX2 available: {has_avx2}; OpenMP enabled: True"
     )
     print(
         "C++ timings use preallocated buffers and exclude framework/autograd "
         "overhead; Houssem and PyTorch include graph creation."
     )
     print(
-        f"{'size':>8} {'framework':<15}{'forward ms':>12}"
-        f"{'backward ms':>14}{'combined ms':>14}{'HT eager/row':>14}"
+        f"{'size':>8} {'implementation':<22}{'threads':>8}"
+        f"{'forward ms':>12}{'backward ms':>14}{'combined ms':>14}"
+        f"{'vs HT eager':>13}"
     )
     for size in SIZES:
         rng = np.random.default_rng(size)
@@ -240,18 +321,38 @@ def main():
         eager = _framework_case(a_data, b_data, "Houssem")
         fused = _framework_case(a_data, b_data, "Houssem", fused=True)
         pytorch = _framework_case(a_data, b_data, "PyTorch")
-        cpp = _cpp_case(library, a_data, b_data)
-        for name, result in (
-            ("Houssem eager", eager),
-            ("Houssem Numba", fused),
-            ("PyTorch eager", pytorch),
-            ("C++ kernel", cpp),
-        ):
-            ratio = eager[2] / result[2] if result[2] else float("inf")
-            print(
-                f"{size:>8} {name:<15}{result[0]:>12.4f}"
-                f"{result[1]:>14.4f}{result[2]:>14.4f}{ratio:>11.2f}x"
+        results = [
+            ("Houssem eager", 1, eager),
+            ("Houssem Numba", 1, fused),
+            ("PyTorch eager", THREADS, pytorch),
+            ("C++ scalar", 1, _cpp_case(library, a_data, b_data)),
+        ]
+        if has_avx2:
+            results.append(
+                ("C++ AVX2", 1, _cpp_case(library, a_data, b_data, "_avx2"))
             )
+        for thread_count in OMP_THREAD_COUNTS:
+            library.fusion_cpp_set_threads(thread_count)
+            results.append(
+                (
+                    "C++ OpenMP",
+                    thread_count,
+                    _cpp_case(library, a_data, b_data, "_omp"),
+                )
+            )
+        for name, thread_count, timing in results:
+            ratio = eager[2] / timing[2] if timing[2] else float("inf")
+            print(
+                f"{size:>8} {name:<22}{thread_count:>8}"
+                f"{timing[0]:>12.4f}{timing[1]:>14.4f}"
+                f"{timing[2]:>14.4f}{ratio:>12.2f}x"
+            )
+        cpp_buffer_bytes = size * np.dtype(np.float32).itemsize * 5
+        print(
+            f"  memory estimate: C++ combined buffers={cpp_buffer_bytes} bytes "
+            f"(no kernel scratch); Houssem Python-traced peak="
+            f"{_houssem_peak_bytes(a_data, b_data)} bytes"
+        )
 
 
 if __name__ == "__main__":

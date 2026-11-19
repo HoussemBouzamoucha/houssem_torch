@@ -1,63 +1,102 @@
-# Standalone C++ Fusion Benchmark
+# C++ CPU optimization benchmark
 
-**Run:** 2026-11-13  
-**CPU:** Intel Core i7-10750H @ 2.60 GHz  
-**Compiler:** MinGW-w64 g++ 15.2.0, `-std=c++17 -O3 -march=native`  
-**Runtime:** Windows, Python 3.13.11, one thread  
-**Libraries:** NumPy 2.5.4, Numba 0.68.1, PyTorch 2.15.0+cpu  
-**Measurement:** 5 warmups, 31 repetitions, medians
+## Setup
 
-The script validated C++ forward outputs and both input gradients against
-Houssem Torch eager and PyTorch eager on 257 random `float32` values before
-timing.
+- **CPU:** Intel Core i7-10750H @ 2.60 GHz
+- **Compiler:** MinGW-w64 g++ 15.2.0, `-std=c++17 -O3 -fopenmp`
+- **Runtime:** Windows, Python 3.13.11
+- **Libraries:** NumPy 2.5.4, Numba 0.68.1, PyTorch 2.15.0+cpu
+- **Measurements:** 5 warmups, 21 repetitions, medians; framework baselines
+  use one thread
+- **CPU features:** AVX2 available; OpenMP enabled
 
-## Workload
+The script validates forward outputs and gradients against Houssem Torch and
+PyTorch before timing. Validation includes negative and near-zero preactivations,
+vector-tail lengths, and arbitrary upstream gradients.
 
-The standalone C++ kernel evaluates:
+## Combined forward + backward
 
-```text
-y = log(exp(relu((a * b + 0.25) / 2.0)) + 1.0)
-```
+Times are milliseconds. OpenMP uses static contiguous work sharing. The
+parallel region is disabled below 8,192 elements; the one-thread OpenMP entry
+point still has some runtime overhead at small sizes.
 
-Its backward kernel calculates gradients of `sum(y)` with respect to both
-inputs. The C++ combined kernel computes forward values and gradients in one
-loop. The Houssem and PyTorch measurements include their operation graphs and
-autograd. C++ uses preallocated buffers and a single `ctypes` call; it does not
-construct framework tensors or an autograd graph. Therefore the C++ timings
-are kernel-level results, not an end-to-end, like-for-like framework
-comparison. Compilation is excluded.
+| Elements | Houssem eager | PyTorch eager | C++ scalar | C++ AVX2 | OpenMP 1 thread | OpenMP 2 threads | OpenMP 4 threads | OpenMP 6 threads |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0.3824 | 0.2090 | 0.0031 | 0.0023 | 0.0072 | 0.0076 | 0.0071 | 0.0077 |
+| 256 | 0.3160 | 0.3207 | 0.0089 | 0.0039 | 0.0212 | 0.0403 | 0.0214 | 0.0217 |
+| 1,024 | 0.6272 | 0.2827 | 0.0226 | 0.0098 | 0.0274 | 0.0267 | 0.0266 | 0.0288 |
+| 4,096 | 0.3879 | 0.2929 | 0.0882 | 0.0210 | 0.0953 | 0.0914 | 0.0883 | 0.0884 |
+| 16,384 | 0.5782 | 0.3235 | 0.4620 | 0.0779 | 0.4095 | 0.2541 | 0.1669 | 0.1706 |
+| 65,536 | 1.1636 | 1.2670 | 1.6765 | 0.2684 | 1.3502 | 0.6904 | 0.4178 | 0.3106 |
 
-Times are milliseconds in `forward / backward / combined` order. The last
-column is Houssem eager combined time divided by the C++ combined time.
+This is not an end-to-end comparison: C++ uses preallocated buffers and a
+single native call, while Houssem Torch and PyTorch include operation-tensor
+and autograd-graph work. The framework combined timing also includes reduction
+to a scalar loss; the C++ kernel assumes an all-ones upstream gradient. In
+this run the AVX2 kernel-only combined time was 0.2684 ms at 65,536 elements;
+six-thread OpenMP was 0.3106 ms. These are measurements of this fixed
+workload, not general framework speedups.
 
-| Elements | Houssem eager | Houssem Numba fusion | PyTorch eager | C++ kernel | HT eager / C++ |
-|---:|---:|---:|---:|---:|---:|
-| 64 | 0.0739 / 0.2214 / 0.4822 | 0.3575 / 0.4121 / 1.0093 | 0.1229 / 0.1670 / 0.2602 | 0.0029 / 0.0030 / 0.0035 | 137.77x |
-| 256 | 0.0738 / 0.2030 / 0.4095 | 0.4817 / 0.3670 / 1.0971 | 0.1547 / 0.3106 / 0.4704 | 0.0104 / 0.0081 / 0.0119 | 34.41x |
-| 1,024 | 0.0920 / 0.2746 / 0.3682 | 0.5162 / 0.6497 / 1.3818 | 0.1708 / 0.2722 / 0.4717 | 0.0217 / 0.0145 / 0.0255 | 14.44x |
-| 4,096 | 0.1569 / 0.2841 / 0.4159 | 0.5412 / 0.5747 / 1.5720 | 0.1346 / 0.3275 / 0.4037 | 0.0840 / 0.0859 / 0.1061 | 3.92x |
-| 16,384 | 0.3100 / 0.4155 / 0.7386 | 0.6759 / 1.1879 / 4.4134 | 0.2247 / 0.4095 / 0.5386 | 0.4440 / 0.1977 / 0.3801 | 1.94x |
-| 65,536 | 1.0558 / 1.5504 / 3.3066 | 2.8209 / 3.6653 / 7.8797 | 0.5303 / 1.2996 / 1.0638 | 1.2738 / 0.6608 / 1.2965 | 2.55x |
+At 65,536 elements, the forward/backward medians were:
 
-`torch.compile` was not included. The current Windows environment reports
-that PyTorch Inductor cannot find the MSVC `cl` compiler.
+| Variant | Forward (ms) | Backward (ms) | Combined (ms) |
+|---|---:|---:|---:|
+| C++ scalar | 1.3627 | 0.8046 | 1.6765 |
+| C++ AVX2 | 0.2295 | 0.1789 | 0.2684 |
+| C++ OpenMP, 2 threads | 0.5456 | 0.3658 | 0.6904 |
+| C++ OpenMP, 4 threads | 0.3705 | 0.2652 | 0.4178 |
+| C++ OpenMP, 6 threads | 0.3092 | 0.1912 | 0.3106 |
 
-## Interpretation and caveats
+OpenMP helps at the larger sizes, but thread startup/scheduling dominates
+small workloads. The AVX2 variant is single-threaded and computes exponentials
+and logarithms using approximations (range-reduced exp polynomial and log1p
+series), rather than calling scalar `std::exp`/`std::log` for each element.
+Its measured speed should therefore be considered together with the numerical
+validation and the approximation limitation.
 
-- The specialized C++ loop was faster than Houssem eager for the **combined**
-  workload at all tested sizes in this run. Its kernel-only combined time was
-  also close to PyTorch eager at 65,536 elements (1.2965 ms versus 1.0638 ms).
-- C++ forward time was not always faster than Houssem eager, and individual
-  measurements show some system noise. Re-run on an otherwise idle machine
-  before drawing conclusions about small differences.
-- The large C++/framework ratios partly reflect what is timed: C++ has no
-  tensor construction, autograd graph, or output-buffer allocation. They
-  should not be presented as an end-to-end framework speedup.
-- This is a fixed-shape, contiguous `float32` experiment. It does not implement
-  general broadcasting, arbitrary expressions, a reusable autograd graph, or
-  a Python tensor backend.
-- The C++ kernel's backward formula is manually specialized for this workload;
-  it does not replace or modify Houssem Torch's autograd implementation.
+## Memory and allocation behavior
+
+The combined C++ kernel allocates no intermediate tensors or scratch buffers.
+Its preallocated working set is five `float32` arrays (`a`, `b`, output, and
+two gradients), or 20 bytes per element. Houssem's Python-traced forward
+peaks were:
+
+| Elements | C++ combined buffers | Houssem Python-traced peak |
+|---:|---:|---:|
+| 64 | 1,280 B | 9,388 B |
+| 256 | 5,120 B | 16,300 B |
+| 1,024 | 20,480 B | 43,948 B |
+| 4,096 | 81,920 B | 154,540 B |
+| 16,384 | 327,680 B | 596,908 B |
+| 65,536 | 1,310,720 B | 2,366,380 B |
+
+These are not equivalent allocator measurements: C++ reports the known
+preallocated input/output/gradient buffers, whereas Python `tracemalloc`
+reports Python-tracked allocations and may omit native allocations. Neither
+the C++ working-set estimate nor its timing includes a Python wrapper's
+allocation of the buffers.
+
+## Implementation and limitations
+
+- `-O3` enables compiler optimizations. The scalar implementation remains
+  portable and serves as a reference.
+- AVX2 is isolated in target-specific functions and selected only when the
+  runtime CPU feature check succeeds; it processes eight `float32` values per
+  vector and handles the remainder with the scalar reference.
+- OpenMP partitions contiguous ranges statically. A threshold prevents
+  parallel-region execution below 8,192 elements.
+- The experiment is fixed to contiguous `float32` inputs and this expression.
+  AVX2 uses approximate transcendental functions, validated on random values
+  and near the ReLU boundary; extreme-value behavior has not been exhaustively
+  characterized. It is not a general fusion engine or a replacement for
+  Houssem Torch autograd.
+- Results vary with CPU load, power management, and runtime scheduling; the
+  short benchmark should be rerun on an idle target machine.
+
+The harness also prints Houssem Numba fusion timings. In this run it was
+slower than Houssem eager at every tested size. `torch.compile` remains
+excluded because this Windows environment lacks the MSVC `cl` compiler
+required by the installed PyTorch Inductor setup.
 
 Run [`benchmark.py`](./benchmark.py) to rebuild the DLL, repeat the numerical
 checks, and collect new medians. The generated library is kept under
