@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1310" viewBox="0 0 1400 1310" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b5263"/></marker>
+<style>.title{font-size:26px;font-weight:700;fill:#1f2430}.leg{font-size:13.5px;fill:#4b5263}
+.h1{font-size:19px;font-weight:700;fill:#1f2430}.h2{font-size:15px;font-weight:700}
+.b{font-size:14.5px;font-weight:600;fill:#1f2430}.s{font-size:12.5px;fill:#5a6070;font-family:Consolas,Menlo,monospace}
+.lbl{font-size:13px;fill:#4b5263;font-style:italic}.wire{stroke:#4b5263;stroke-width:2;fill:none}</style></defs>
+<rect width="1400" height="1310" fill="#ffffff"/>
+<text x="700" y="44" text-anchor="middle" class="title">French → English transformer: every stage, with shapes</text>
+<text x="700" y="74" text-anchor="middle" class="leg">B batch size · S French length · T English length · d model width · h heads · d_k = d / h · d_ff feed-forward width · V vocabulary (8,192 or 16,384) · N stacked layers</text>
+<text x="700" y="96" text-anchor="middle" class="leg">Each layer normalizes before each block ("pre-norm"), which trains more stably from scratch; the original paper normalized after.</text>
+<text x="340" y="158" text-anchor="middle" class="h1">ENCODER: reads French</text>
+<text x="1040" y="158" text-anchor="middle" class="h1">DECODER: writes English</text>
+<rect x="105" y="170" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="190" text-anchor="middle" class="b">French token ids</text>
+<text x="340.0" y="208" text-anchor="middle" class="s">(B, S)  integers</text>
+<rect x="105" y="236" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="256" text-anchor="middle" class="b">Shared embedding × √d</text>
+<text x="340.0" y="274" text-anchor="middle" class="s">(B, S) → (B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 218 V234"/>
+<rect x="105" y="302" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="322" text-anchor="middle" class="b">+ position encoding, dropout</text>
+<text x="340.0" y="340" text-anchor="middle" class="s">(B, S, d) → (B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 284 V300"/>
+<rect x="80" y="358" width="520" height="440" rx="14" fill="#eef4ff" stroke="#4a6fd1" stroke-width="2"/>
+<text x="98" y="382" class="h2" fill="#4a6fd1">Encoder layer × N</text>
+<rect x="105" y="398" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="418" text-anchor="middle" class="b">LayerNorm</text>
+<text x="340.0" y="436" text-anchor="middle" class="s">(B, S, d) → (B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 350 V396"/>
+<rect x="105" y="464" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="484" text-anchor="middle" class="b">Self-attention: every word sees every word</text>
+<text x="340.0" y="502" text-anchor="middle" class="s">Q,K,V (B,h,S,d_k) · scores (B,h,S,S) · out (B,S,d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 446 V462"/>
+<rect x="105" y="530" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="550" text-anchor="middle" class="b">Add (residual): x + attention(x)</text>
+<text x="340.0" y="568" text-anchor="middle" class="s">(B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 512 V528"/>
+<rect x="105" y="596" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="616" text-anchor="middle" class="b">LayerNorm</text>
+<text x="340.0" y="634" text-anchor="middle" class="s">(B, S, d) → (B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 578 V594"/>
+<rect x="105" y="662" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="682" text-anchor="middle" class="b">Feed-forward</text>
+<text x="340.0" y="700" text-anchor="middle" class="s">(B,S,d) → (B,S,d_ff) → (B,S,d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 644 V660"/>
+<rect x="105" y="728" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="748" text-anchor="middle" class="b">Add (residual): x + feed_forward(x)</text>
+<text x="340.0" y="766" text-anchor="middle" class="s">(B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 710 V726"/>
+<rect x="105" y="818" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="838" text-anchor="middle" class="b">Final LayerNorm</text>
+<text x="340.0" y="856" text-anchor="middle" class="s">(B, S, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 776 V816"/>
+<rect x="105" y="884" width="470" height="48" rx="9" fill="#ffffff" stroke="#4a6fd1" stroke-width="1.5"/>
+<text x="340.0" y="904" text-anchor="middle" class="b">Encoder output (“memory”)</text>
+<text x="340.0" y="922" text-anchor="middle" class="s">(B, S, d)  computed once per sentence</text>
+<path class="wire" marker-end="url(#arrow)" d="M340.0 866 V882"/>
+<rect x="785" y="170" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="190" text-anchor="middle" class="b">English token ids, shifted right</text>
+<text x="1040.0" y="208" text-anchor="middle" class="s">(B, T)  integers, starts with &lt;bos&gt;</text>
+<rect x="785" y="236" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="256" text-anchor="middle" class="b">Shared embedding × √d</text>
+<text x="1040.0" y="274" text-anchor="middle" class="s">(B, T) → (B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 218 V234"/>
+<rect x="785" y="302" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="322" text-anchor="middle" class="b">+ position encoding, dropout</text>
+<text x="1040.0" y="340" text-anchor="middle" class="s">(B, T, d) → (B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 284 V300"/>
+<rect x="760" y="358" width="560" height="638" rx="14" fill="#fff5e8" stroke="#d98a1f" stroke-width="2"/>
+<text x="778" y="382" class="h2" fill="#d98a1f">Decoder layer × N</text>
+<rect x="785" y="398" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="418" text-anchor="middle" class="b">LayerNorm</text>
+<text x="1040.0" y="436" text-anchor="middle" class="s">(B, T, d) → (B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 350 V396"/>
+<rect x="785" y="464" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="484" text-anchor="middle" class="b">Masked self-attention: sees only earlier words</text>
+<text x="1040.0" y="502" text-anchor="middle" class="s">Q,K,V (B,h,T,d_k) · scores (B,h,T,T) · out (B,T,d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 446 V462"/>
+<rect x="785" y="530" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="550" text-anchor="middle" class="b">Add (residual)</text>
+<text x="1040.0" y="568" text-anchor="middle" class="s">(B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 512 V528"/>
+<rect x="785" y="596" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="616" text-anchor="middle" class="b">LayerNorm</text>
+<text x="1040.0" y="634" text-anchor="middle" class="s">(B, T, d) → (B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 578 V594"/>
+<rect x="785" y="662" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="682" text-anchor="middle" class="b">Cross-attention: English looks at French</text>
+<text x="1040.0" y="700" text-anchor="middle" class="s">Q (B,h,T,d_k) · K,V (B,h,S,d_k) · scores (B,h,T,S)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 644 V660"/>
+<rect x="785" y="728" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="748" text-anchor="middle" class="b">Add (residual)</text>
+<text x="1040.0" y="766" text-anchor="middle" class="s">(B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 710 V726"/>
+<rect x="785" y="794" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="814" text-anchor="middle" class="b">LayerNorm</text>
+<text x="1040.0" y="832" text-anchor="middle" class="s">(B, T, d) → (B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 776 V792"/>
+<rect x="785" y="860" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="880" text-anchor="middle" class="b">Feed-forward</text>
+<text x="1040.0" y="898" text-anchor="middle" class="s">(B,T,d) → (B,T,d_ff) → (B,T,d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 842 V858"/>
+<rect x="785" y="926" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="946" text-anchor="middle" class="b">Add (residual)</text>
+<text x="1040.0" y="964" text-anchor="middle" class="s">(B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 908 V924"/>
+<rect x="785" y="1016" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="1036" text-anchor="middle" class="b">Final LayerNorm</text>
+<text x="1040.0" y="1054" text-anchor="middle" class="s">(B, T, d)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 974 V1014"/>
+<rect x="785" y="1082" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="1102" text-anchor="middle" class="b">Output projection (shares the embedding)</text>
+<text x="1040.0" y="1120" text-anchor="middle" class="s">(B, T, d) → (B, T, V)   ← the biggest tensor</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 1064 V1080"/>
+<rect x="785" y="1148" width="510" height="48" rx="9" fill="#ffffff" stroke="#d98a1f" stroke-width="1.5"/>
+<text x="1040.0" y="1168" text-anchor="middle" class="b">Softmax + cross-entropy (label smoothing)</text>
+<text x="1040.0" y="1186" text-anchor="middle" class="s">(B,T,V) + labels (B,T) → loss (one number)</text>
+<path class="wire" marker-end="url(#arrow)" d="M1040.0 1130 V1146"/>
+<path class="wire" stroke-width="2.5" marker-end="url(#arrow)" d="M575 908 H680 V686 H783"/>
+<text x="640" y="789.0" text-anchor="middle" class="lbl">keys &amp;</text>
+<text x="640" y="805.0" text-anchor="middle" class="lbl">values</text>
+<text x="640" y="821.0" text-anchor="middle" class="lbl">(every</text>
+<text x="640" y="837.0" text-anchor="middle" class="lbl">layer)</text>
+<path d="M575 260 H785" stroke="#7a5bd1" stroke-width="1.5" stroke-dasharray="4 4" fill="none"/>
+<text x="680" y="254" text-anchor="middle" class="lbl" fill="#7a5bd1">same table (V, d)</text>
+<text x="700" y="1262" text-anchor="middle" class="leg">Translating after training: the encoder runs once per sentence; the decoder repeats once per English word with T = 1,</text>
+<text x="700" y="1284" text-anchor="middle" class="leg">reusing cached keys &amp; values for its own past words and for the French memory.</text>
+</svg>

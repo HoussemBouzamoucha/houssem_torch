@@ -114,7 +114,30 @@ def log(a: CPUStorage) -> CPUStorage:
     return CPUStorage(np.log(a.array))
 
 def pow(a: CPUStorage, exponent: float) -> CPUStorage:
-    return CPUStorage(np.power(a.array, exponent))
+    return CPUStorage(np.power(a.array, a.array.dtype.type(exponent)))
+
+def sqrt(a: CPUStorage) -> CPUStorage:
+    return CPUStorage(np.sqrt(a.array))
+
+def gelu(a: CPUStorage) -> CPUStorage:
+    """GELU, tanh approximation (matches torch gelu(approximate='tanh'))."""
+    x = a.array
+    c = x.dtype.type(np.sqrt(2.0 / np.pi))
+    return CPUStorage(0.5 * x * (1.0 + np.tanh(c * (x + 0.044715 * x * x * x))))
+
+def masked_fill(a: CPUStorage, mask: np.ndarray, value: float) -> CPUStorage:
+    return CPUStorage(np.where(mask, a.array.dtype.type(value), a.array))
+
+
+# ------------------------------------------------------------------
+# Indexing
+# ------------------------------------------------------------------
+
+def getitem(a: CPUStorage, index) -> CPUStorage:
+    return CPUStorage(np.asarray(a.array[index]))
+
+def embedding(weight: CPUStorage, ids: np.ndarray) -> CPUStorage:
+    return CPUStorage(weight.array[ids])
 
 
 # ------------------------------------------------------------------
@@ -132,6 +155,7 @@ def max(a, axis=None, keepdims=False):
 
 def min(a, axis=None, keepdims=False):
     return CPUStorage(np.asarray(np.min(a.array, axis=axis, keepdims=keepdims)))
+
 
 
 # ------------------------------------------------------------------
@@ -153,10 +177,22 @@ def softmax(a: CPUStorage, axis: int = -1) -> CPUStorage:
     e_x = np.exp(x - x_max)
     return CPUStorage(e_x / np.sum(e_x, axis=axis, keepdims=True))
 
+def log_softmax(a: CPUStorage, axis: int = -1) -> CPUStorage:
+    # log(softmax(x)) = (x - max) - log(sum(exp(x - max))), never takes log(0)
+    shifted = a.array - np.max(a.array, axis=axis, keepdims=True)
+    return CPUStorage(shifted - np.log(np.sum(np.exp(shifted), axis=axis,
+                                              keepdims=True)))
+
 def layer_norm(a: CPUStorage, weight: CPUStorage, bias: CPUStorage,
-               eps: float = 1e-5) -> CPUStorage:
+               eps: float = 1e-5):
+    """Normalize over the last axis. Returns (out, x_hat, rstd).
+
+    x_hat = (x - mean) * rstd and rstd = 1 / sqrt(var + eps) are returned
+    because the backward pass needs them.
+    """
     x = a.array
     mean_ = np.mean(x, axis=-1, keepdims=True)
-    var = np.var(x, axis=-1, keepdims=True)
-    x_norm = (x - mean_) / np.sqrt(var + eps)
-    return CPUStorage(weight.array * x_norm + bias.array)
+    var = np.mean(np.square(x - mean_), axis=-1, keepdims=True)
+    rstd = 1.0 / np.sqrt(var + x.dtype.type(eps))
+    x_hat = (x - mean_) * rstd
+    return CPUStorage(x_hat * weight.array + bias.array), x_hat, rstd

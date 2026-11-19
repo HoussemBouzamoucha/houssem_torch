@@ -1,0 +1,15 @@
+{
+  "vocab_size": 16384,
+  "d_model": 512,
+  "n_heads": 8,
+  "d_ff": 2048,
+  "n_encoder_layers": 6,
+  "n_decoder_layers": 6,
+  "dropout": 0.1,
+  "max_len": 128,
+  "activation": "relu",
+  "label_smoothing": 0.1,
+  "pad_id": 0,
+  "bos_id": 1,
+  "eos_id": 2
+}

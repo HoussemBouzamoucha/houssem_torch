@@ -89,7 +89,7 @@ def test_no_grad_and_reduction_boundary(numba):
         output = ht.exp(x * 2.0 + 1.0)
         total = output.sum()
     assert not output.requires_grad
-    assert output._grad_fn is None
+    assert output.is_leaf
     assert np.allclose(total.numpy(), np.exp([1.0, 3.0, 5.0]).sum())
 
 

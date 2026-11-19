@@ -29,8 +29,11 @@ class Tensor:
         self.device = device
         self.dtype = dtype or float32
         self.requires_grad = requires_grad
-        self.grad: Optional[Tensor] = None
-        self._grad_fn = None
+        # micrograd-style graph state (set by autograd.graph.result):
+        self._grad: Optional[np.ndarray] = None  # dLoss/dself, NumPy array
+        self._prev: tuple = ()                   # parents that require grad
+        self._op: str = ""                       # op name, for debugging
+        self._backward = None                    # fn(g) -> pushes grads to _prev
 
         if _storage is not None:
             # created internally by an op: storage already prepared
@@ -85,26 +88,40 @@ class Tensor:
     # ------------------------------------------------------------------
 
     def reshape(self, *shape) -> Tensor:
-        from houssem_torch.backends.cpu import kernels as cpu
+        from houssem_torch.ops.shape import reshape
         new_shape = shape[0] if len(shape) == 1 and hasattr(shape[0], '__iter__') else shape
-        return Tensor(_storage=cpu.reshape(self._storage, new_shape),
-                      device=self.device, dtype=self.dtype)
+        return reshape(self, new_shape)
 
     def transpose(self, *axes) -> Tensor:
-        from houssem_torch.backends.cpu import kernels as cpu
+        """NumPy semantics: no args reverses all dims, else a full permutation.
+
+        Use ``swapaxes(d0, d1)`` to swap just two dims (PyTorch ``transpose``).
+        """
+        from houssem_torch.ops.shape import permute
         ax = axes[0] if len(axes) == 1 and hasattr(axes[0], '__iter__') else (axes or None)
-        return Tensor(_storage=cpu.transpose(self._storage, ax),
-                      device=self.device, dtype=self.dtype)
+        return permute(self, ax)
+
+    def permute(self, *axes) -> Tensor:
+        from houssem_torch.ops.shape import permute
+        ax = axes[0] if len(axes) == 1 and hasattr(axes[0], '__iter__') else axes
+        return permute(self, ax)
+
+    def swapaxes(self, axis0: int, axis1: int) -> Tensor:
+        from houssem_torch.ops.shape import swapaxes
+        return swapaxes(self, axis0, axis1)
+
+    @property
+    def mT(self) -> Tensor:
+        """Swap the last two dimensions (batched matrix transpose)."""
+        return self.swapaxes(-2, -1)
 
     def squeeze(self, axis=None) -> Tensor:
-        from houssem_torch.backends.cpu import kernels as cpu
-        return Tensor(_storage=cpu.squeeze(self._storage, axis),
-                      device=self.device, dtype=self.dtype)
+        from houssem_torch.ops.shape import squeeze
+        return squeeze(self, axis)
 
     def unsqueeze(self, axis: int) -> Tensor:
-        from houssem_torch.backends.cpu import kernels as cpu
-        return Tensor(_storage=cpu.unsqueeze(self._storage, axis),
-                      device=self.device, dtype=self.dtype)
+        from houssem_torch.ops.shape import unsqueeze
+        return unsqueeze(self, axis)
 
     # ------------------------------------------------------------------
     # Arithmetic operators
@@ -147,17 +164,91 @@ class Tensor:
         from houssem_torch.ops.pointwise import negate
         return negate(self)
 
+    def __pow__(self, exponent) -> Tensor:
+        from houssem_torch.ops.pointwise import pow
+        return pow(self, exponent)
+
+    def sqrt(self) -> Tensor:
+        from houssem_torch.ops.pointwise import sqrt
+        return sqrt(self)
+
+    def masked_fill(self, mask, value: float) -> Tensor:
+        from houssem_torch.ops.pointwise import masked_fill
+        return masked_fill(self, mask, value)
+
+    def softmax(self, axis: int = -1) -> Tensor:
+        from houssem_torch.ops.activation import softmax
+        return softmax(self, axis)
+
+    def log_softmax(self, axis: int = -1) -> Tensor:
+        from houssem_torch.ops.activation import log_softmax
+        return log_softmax(self, axis)
+
+    def __getitem__(self, index) -> Tensor:
+        from houssem_torch.ops.shape import getitem
+        return getitem(self, index)
+
+    def split(self, split_size_or_sections, axis: int = -1):
+        from houssem_torch.ops.shape import split
+        return split(self, split_size_or_sections, axis)
+
+    # ------------------------------------------------------------------
+    # Autograd
+    # ------------------------------------------------------------------
+
     @property
     def is_leaf(self) -> bool:
-        return self._grad_fn is None
+        return not self._prev
+
+    @property
+    def grad(self) -> Optional[Tensor]:
+        if self._grad is None:
+            return None
+        return Tensor(_storage=self._grad_storage(), device=self.device,
+                      dtype=self.dtype)
+
+    @grad.setter
+    def grad(self, value) -> None:
+        if value is None:
+            self._grad = None
+        else:
+            self._grad = value.numpy() if isinstance(value, Tensor) else np.asarray(
+                value, dtype=self.dtype.numpy_name)
+
+    def _grad_storage(self):
+        from houssem_torch.backends.cpu import kernels as cpu
+        return cpu.CPUStorage(self._grad)
+
+    def _accumulate_grad(self, g: np.ndarray) -> None:
+        """`self.grad += g` — call this from your `_backward` closures."""
+        if not self.requires_grad:
+            return
+        if isinstance(g, np.generic):  # NumPy returns scalars for 0-d math
+            g = np.asarray(g)
+        if not isinstance(g, np.ndarray):
+            raise TypeError(
+                f"gradient must be a NumPy array, got {type(g).__name__}. "
+                "Did a backward function forget to `return`?"
+            )
+        if g.shape != self.shape:
+            raise RuntimeError(
+                f"gradient shape {g.shape} != tensor shape {self.shape}"
+            )
+        if self._grad is None:
+            # Leaves own a private, writable copy (closures may pass views or
+            # the same array to several parents); intermediates are transient.
+            self._grad = np.array(g, dtype=self.dtype.numpy_name, copy=True) \
+                if self.is_leaf else g
+        else:
+            self._grad = self._grad + g
 
     def detach(self) -> Tensor:
         """Same storage, no graph history."""
         return Tensor(_storage=self._storage, device=self.device, dtype=self.dtype)
 
-    def backward(self, grad=None) -> None:
+    def backward(self, grad=None, retain_grads: bool = False) -> None:
         from houssem_torch.autograd.engine import backward
-        backward(self, grad)
+        backward(self, grad, retain_grads=retain_grads)
         
 
     def __matmul__(self, other) -> Tensor:
@@ -193,6 +284,3 @@ class Tensor:
             f"device={self.device})\n"
             f"{self._storage.array}"
         )
-    def __rtruediv__(self, other) -> Tensor:
-        from houssem_torch.ops.pointwise import divide
-        return divide(other, self)
