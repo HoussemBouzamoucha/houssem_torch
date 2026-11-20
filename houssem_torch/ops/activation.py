@@ -1,21 +1,36 @@
 """Activations, softmax and dropout.
 
 Each `_backward` hands the saved forward values to its function in
-ops/grads.py, where the gradient math lives.
+ops/grads.py, where the gradient math lives. When Numba is available,
+big inputs take the fused multi-core kernels in backends/cpu/fast.py
+instead (same math, checked against the reference in the tests).
 """
 from __future__ import annotations
 import numpy as np
 from houssem_torch.autograd.graph import result
+from houssem_torch.backends.cpu import fast
 from houssem_torch.ops import grads
+
+
+def _last_axis(axis: int, array: np.ndarray) -> bool:
+    return array.ndim >= 1 and axis % array.ndim == array.ndim - 1
 
 
 def gelu(x):
     """GELU, tanh approximation: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))."""
     from houssem_torch.backends.cpu import kernels as cpu
-    out = cpu.gelu(x._storage)
+    xv = x.numpy()
+    if fast.use(xv):
+        out = cpu.CPUStorage(fast.gelu_forward(fast.flat(xv)).reshape(xv.shape))
 
-    def _backward(g):
-        x._accumulate_grad(grads.gelu_backward(g, x.numpy()))
+        def _backward(g):
+            dx = fast.gelu_backward(fast.flat(g), fast.flat(xv))
+            x._accumulate_grad(dx.reshape(xv.shape))
+    else:
+        out = cpu.gelu(x._storage)
+
+        def _backward(g):
+            x._accumulate_grad(grads.gelu_backward(g, xv))
 
     return result(out, x, (x,), "gelu", _backward)
 
@@ -23,10 +38,19 @@ def gelu(x):
 def softmax(x, axis: int = -1):
     """Numerically stable softmax along `axis` (subtracts the max first)."""
     from houssem_torch.backends.cpu import kernels as cpu
-    out = cpu.softmax(x._storage, axis=axis)  # saved: out.array = probs
+    xv = x.numpy()
+    if _last_axis(axis, xv) and fast.use(xv):
+        probs = fast.softmax_forward(fast.rows(xv))  # saved for backward
+        out = cpu.CPUStorage(probs.reshape(xv.shape))
 
-    def _backward(g):
-        x._accumulate_grad(grads.softmax_backward(g, out.array, axis))
+        def _backward(g):
+            dx = fast.softmax_backward(fast.rows(g), probs)
+            x._accumulate_grad(dx.reshape(xv.shape))
+    else:
+        out = cpu.softmax(x._storage, axis=axis)  # saved: out.array = probs
+
+        def _backward(g):
+            x._accumulate_grad(grads.softmax_backward(g, out.array, axis))
 
     return result(out, x, (x,), "softmax", _backward)
 
@@ -34,10 +58,19 @@ def softmax(x, axis: int = -1):
 def log_softmax(x, axis: int = -1):
     """log(softmax(x)) computed directly, so it never takes log(0)."""
     from houssem_torch.backends.cpu import kernels as cpu
-    out = cpu.log_softmax(x._storage, axis=axis)  # saved: out.array = log p
+    xv = x.numpy()
+    if _last_axis(axis, xv) and fast.use(xv):
+        log_probs = fast.log_softmax_forward(fast.rows(xv))  # saved
+        out = cpu.CPUStorage(log_probs.reshape(xv.shape))
 
-    def _backward(g):
-        x._accumulate_grad(grads.log_softmax_backward(g, out.array, axis))
+        def _backward(g):
+            dx = fast.log_softmax_backward(fast.rows(g), log_probs)
+            x._accumulate_grad(dx.reshape(xv.shape))
+    else:
+        out = cpu.log_softmax(x._storage, axis=axis)  # saved: out.array = log p
+
+        def _backward(g):
+            x._accumulate_grad(grads.log_softmax_backward(g, out.array, axis))
 
     return result(out, x, (x,), "log_softmax", _backward)
 

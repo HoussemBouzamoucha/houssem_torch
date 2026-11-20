@@ -123,7 +123,15 @@ def gelu(a: CPUStorage) -> CPUStorage:
     """GELU, tanh approximation (matches torch gelu(approximate='tanh'))."""
     x = a.array
     c = x.dtype.type(np.sqrt(2.0 / np.pi))
-    return CPUStorage(0.5 * x * (1.0 + np.tanh(c * (x + 0.044715 * x * x * x))))
+    u = x * x                      # x*x*x is ~5x faster than x**3
+    u *= 0.044715 * x
+    u += x
+    u *= c
+    np.tanh(u, out=u)              # in place: one temporary for the chain
+    u += 1.0
+    u *= x
+    u *= 0.5
+    return CPUStorage(u)
 
 def masked_fill(a: CPUStorage, mask: np.ndarray, value: float) -> CPUStorage:
     return CPUStorage(np.where(mask, a.array.dtype.type(value), a.array))
@@ -173,15 +181,16 @@ def matmul(a: CPUStorage, b: CPUStorage) -> CPUStorage:
 def softmax(a: CPUStorage, axis: int = -1) -> CPUStorage:
     # numerically stable: subtract row max before exp
     x = a.array
-    x_max = np.max(x, axis=axis, keepdims=True)
-    e_x = np.exp(x - x_max)
-    return CPUStorage(e_x / np.sum(e_x, axis=axis, keepdims=True))
+    e_x = x - np.max(x, axis=axis, keepdims=True)
+    np.exp(e_x, out=e_x)           # in place: one full-size array in total
+    e_x /= np.sum(e_x, axis=axis, keepdims=True)
+    return CPUStorage(e_x)
 
 def log_softmax(a: CPUStorage, axis: int = -1) -> CPUStorage:
     # log(softmax(x)) = (x - max) - log(sum(exp(x - max))), never takes log(0)
     shifted = a.array - np.max(a.array, axis=axis, keepdims=True)
-    return CPUStorage(shifted - np.log(np.sum(np.exp(shifted), axis=axis,
-                                              keepdims=True)))
+    shifted -= np.log(np.sum(np.exp(shifted), axis=axis, keepdims=True))
+    return CPUStorage(shifted)
 
 def layer_norm(a: CPUStorage, weight: CPUStorage, bias: CPUStorage,
                eps: float = 1e-5):
@@ -191,8 +200,10 @@ def layer_norm(a: CPUStorage, weight: CPUStorage, bias: CPUStorage,
     because the backward pass needs them.
     """
     x = a.array
-    mean_ = np.mean(x, axis=-1, keepdims=True)
-    var = np.mean(np.square(x - mean_), axis=-1, keepdims=True)
+    x_hat = x - np.mean(x, axis=-1, keepdims=True)    # centered, computed once
+    var = np.mean(np.square(x_hat), axis=-1, keepdims=True)
     rstd = 1.0 / np.sqrt(var + x.dtype.type(eps))
-    x_hat = (x - mean_) * rstd
-    return CPUStorage(x_hat * weight.array + bias.array), x_hat, rstd
+    x_hat *= rstd
+    out = x_hat * weight.array
+    out += bias.array
+    return CPUStorage(out), x_hat, rstd

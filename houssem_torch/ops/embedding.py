@@ -1,6 +1,7 @@
 from __future__ import annotations
 import numpy as np
 from houssem_torch.autograd.graph import result
+from houssem_torch.backends.cpu import fast
 from houssem_torch.ops import grads
 
 
@@ -29,6 +30,12 @@ def embedding(ids, weight):
     out = cpu.embedding(weight._storage, idx)
 
     def _backward(g):
-        weight._accumulate_grad(grads.embedding_backward(g, idx, vocab))
+        if fast.use(g):
+            d = g.shape[-1]
+            ids = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
+            weight._accumulate_grad(
+                fast.embedding_backward(fast.rows(g), ids, vocab).reshape(vocab, d))
+        else:
+            weight._accumulate_grad(grads.embedding_backward(g, idx, vocab))
 
     return result(out, weight, (weight,), "embedding", _backward)

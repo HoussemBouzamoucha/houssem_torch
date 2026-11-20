@@ -212,8 +212,10 @@ class Tensor:
         if value is None:
             self._grad = None
         else:
-            self._grad = value.numpy() if isinstance(value, Tensor) else np.asarray(
-                value, dtype=self.dtype.numpy_name)
+            # always a private copy, so accumulation can add into it in place
+            self._grad = np.array(value.numpy() if isinstance(value, Tensor)
+                                  else value, dtype=self.dtype.numpy_name,
+                                  copy=True)
 
     def _grad_storage(self):
         from houssem_torch.backends.cpu import kernels as cpu
@@ -239,8 +241,10 @@ class Tensor:
             # the same array to several parents); intermediates are transient.
             self._grad = np.array(g, dtype=self.dtype.numpy_name, copy=True) \
                 if self.is_leaf else g
+        elif self.is_leaf:
+            self._grad += g  # the leaf owns its array: add in place
         else:
-            self._grad = self._grad + g
+            self._grad = self._grad + g  # may be shared with another node
 
     def detach(self) -> Tensor:
         """Same storage, no graph history."""

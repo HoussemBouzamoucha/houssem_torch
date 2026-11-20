@@ -94,8 +94,18 @@ def getitem_backward(g: np.ndarray, input_shape: tuple, index) -> np.ndarray:
     Bonus: `split` is built on getitem, so this also makes split work.
     """
     grad = np.zeros(input_shape, dtype=g.dtype)
-    np.add.at(grad, index, g)  # in place, sums repeated indices; returns None
+    if _is_basic_index(index):
+        grad[index] = g        # slices/ints never repeat an element: exact
+    else:
+        np.add.at(grad, index, g)  # in place, sums repeated indices
     return grad
+
+
+def _is_basic_index(index) -> bool:
+    """True for slices, ints, None and Ellipsis only (no arrays or lists)."""
+    parts = index if isinstance(index, tuple) else (index,)
+    return all(p is None or p is Ellipsis or isinstance(p, (slice, int, np.integer))
+               for p in parts)
 
 
 def embedding_backward(g: np.ndarray, ids: np.ndarray,
@@ -132,8 +142,9 @@ def gelu_backward(g: np.ndarray, x: np.ndarray) -> np.ndarray:
           Compute tanh(u) once and reuse it.
     """
     c = x.dtype.type(np.sqrt(2.0 / np.pi))
-    t = np.tanh(c * (x + 0.044715 * x ** 3))  # computed once, reused
-    du_dx = c * (1.0 + 3 * 0.044715 * x ** 2)
+    x2 = x * x                                # x*x is much faster than x**2
+    t = np.tanh(c * (x + 0.044715 * x2 * x))  # computed once, reused
+    du_dx = c * (1.0 + 3 * 0.044715 * x2)
     # product rule: d/dx [0.5·x·(1 + t)] = 0.5·(1 + t) + 0.5·x·(1 - t²)·du/dx
     return g * 0.5 * ((1.0 + t) + x * (1.0 - t * t) * du_dx)
 
@@ -195,11 +206,14 @@ def cross_entropy_backward(g: np.ndarray, log_probs: np.ndarray,
           Build q with np.full(..., ε/V) and add (1-ε) at the targets.
     """
     n, vocab = log_probs.shape
-    q = np.full_like(log_probs, label_smoothing / vocab)
-    q[np.arange(n), targets] += 1.0 - label_smoothing
-    # d loss_n / d logits = p - q   (prediction minus target)
-    dlogits = (np.exp(log_probs) - q) * valid[:, None]  # padding rows -> 0
-    return dlogits * (g / max(count, 1))
+    # d loss_n / d logits = p - q   (prediction minus target), with
+    # q = ε/V everywhere plus (1-ε) at the target: subtract the two parts
+    # in place instead of building q.
+    dlogits = np.exp(log_probs)
+    dlogits -= label_smoothing / vocab
+    dlogits[np.arange(n), targets] -= 1.0 - label_smoothing
+    dlogits *= (valid * (g / max(count, 1)))[:, None].astype(dlogits.dtype)
+    return dlogits                                # padding rows -> 0
 
 
 # ---------------------------------------------------------------------------

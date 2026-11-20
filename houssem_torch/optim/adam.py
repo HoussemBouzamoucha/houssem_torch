@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+from houssem_torch.backends.cpu import fast
 from houssem_torch.optim.optimizer import Optimizer
 
 
@@ -45,17 +46,30 @@ class Adam(Optimizer):
         for i, p in enumerate(self.params):
             if p._grad is None:
                 continue
-            grad = p._grad
-            if self.weight_decay and not self._decoupled_decay:  # L2 penalty
-                grad = grad + self.weight_decay * p.numpy()
             self.steps[i] += 1
             t = self.steps[i]
-            m, v = self.m[i], self.v[i]
+            bc1, bc2 = 1 - b1 ** t, 1 - b2 ** t  # bias corrections
+            pv, m, v = p.numpy(), self.m[i], self.v[i]
+            if fast.use(pv, p._grad) and _contiguous(pv, m, v):
+                # one fused pass: L2 penalty, moments and update together
+                self._decay(p)
+                l2 = 0.0 if self._decoupled_decay else self.weight_decay
+                fast.adam_step(pv.reshape(-1), fast.flat(p._grad), m.reshape(-1),
+                               v.reshape(-1), self.lr, b1, b2, bc1, bc2,
+                               self.eps, l2)
+                continue
+            grad = p._grad
+            if self.weight_decay and not self._decoupled_decay:  # L2 penalty
+                grad = grad + self.weight_decay * pv
             m *= b1
             m += (1 - b1) * grad
             v *= b2
             v += (1 - b2) * np.square(grad)
-            m_hat = m / (1 - b1 ** t)
-            v_hat = v / (1 - b2 ** t)
+            m_hat = m / bc1
+            v_hat = v / bc2
             self._decay(p)
-            p.numpy()[...] -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            pv[...] -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+
+def _contiguous(*arrays) -> bool:
+    return all(a.flags.c_contiguous for a in arrays)
