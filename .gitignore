@@ -9,3 +9,5 @@ build/
 *.so
 *.pyd
 .DS_Store
+# personal session planning
+next.md
