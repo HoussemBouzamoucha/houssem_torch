@@ -1,6 +1,7 @@
 # Research notes: beating general-purpose compilers on fixed-config transformer training
 
-*Last updated: 2026-11-21. Literature status is as of that date.*
+*Last updated: 2026-11-23. Literature status is as of 2026-11-21. First T4
+measurements: §7 (they revise the order of work in §5).*
 
 houssem_torch only trains transformers, and every run is fixed by a config
 file: the architecture and all tensor shapes are known when the run starts.
@@ -58,6 +59,10 @@ layers, d_ff 512, 32k joint vocabulary, 8192 tokens per batch, on a T4.
   values, apply the exact label-smoothing mode (including `non_target`), and
   write the gradient back directly. Payoff: much less memory traffic, and the
   freed memory goes to bigger batches.
+- *Measured (§7), at d_model 512 / 16k vocab:* the head is 12% of a compiled
+  step, and most of that is its unavoidable matrix multiplies. The speed gain
+  is small there (~2–3%); the memory gain is large. The head's share grows
+  as d_model shrinks or the vocabulary grows, as in the example config above.
 
 ### 2.2 Attention written for Turing
 - The official FlashAttention-2 targets Ampere and newer.
@@ -74,6 +79,9 @@ layers, d_ff 512, 32k joint vocabulary, 8192 tokens per batch, on a T4.
   overhead, not by compute.
 - Choose a few length buckets from the config, compile kernels for each, and
   capture the whole training step as one CUDA graph per bucket.
+- *Measured (§7):* at d_model 512 and batch 64 × 64 the GPU is idle only 1%
+  of the step, and `reduce-overhead` is no faster than `compile`. This only
+  pays for much smaller models or batches.
 
 ### 2.4 Fusing across two matrix multiplies
 - **Feed-forward block:** compute `relu(x W1)` one tile of d_ff at a time and
@@ -194,19 +202,28 @@ PyTorch can't easily adopt this without giving up on supporting any shape.
 INT8 training (§3.6) is a separate, high-risk experiment. It's cheap to try
 once a GPU backend exists, and it needs a quality check alongside it.
 
+*Revised 2026-11-23 after the T4 measurements (§7).* The megakernel idea
+stands, but its case is now memory traffic, not launch overhead: the GPU is
+already 99% busy. The concrete gap is that on a T4 Inductor fuses nothing
+into matrix multiplies (§7.3).
+
 **Order of work:**
-1. **Measure.** Profile the target config on a T4 in three modes: PyTorch as
-   is, `torch.compile`, and `torch.compile(mode="reduce-overhead")`. Use
-   `torch.profiler` or `TORCH_LOGS="output_code"`. The time split (matrix
-   multiplies / attention / loss / other / idle between kernels) decides what
-   to build first.
+1. ~~**Measure.**~~ Done 2026-11-23 for `transformer_base`, see §7. Still to
+   do: the same run on the actual training config and batch shape.
 2. **GPU basics:** device abstraction, GPU storage, cuBLAS matrix multiplies.
-   First hand-written kernel: Cut Cross-Entropy.
-3. **Static memory planner**, with remat optimization in the style of
-   Checkmate.
-4. **Megakernel prototype** for one encoder/decoder layer, then the whole
-   step, measured against `torch.compile`. Read gpt2.cu's code and the MPK
-   paper in full first.
+3. **First kernel: fused residual + dropout + LayerNorm**, forward and
+   backward (~13% of a compiled step). Simple, memory-bound, and the
+   building block for step 4.
+4. **GEMM epilogue fusion:** bias, ReLU, dropout and the residual add inside
+   the matrix multiply (CUTLASS epilogues or own kernels). Main thesis
+   candidate: Inductor can't do it on a T4.
+5. **Fused attention for short sequences on sm_75** (~10% of a step, backward
+   is 2/3 of it). Head size 64 and length ≤ 128 fit one head in shared memory.
+6. **Logits-free cross-entropy** (memory) and **AdamW with the GradScaler
+   unscale folded in**.
+7. **Static memory planner**, then the **megakernel prototype** for one
+   encoder/decoder layer, measured against `torch.compile`. Read gpt2.cu's
+   code and the MPK paper in full first.
 
 ---
 
@@ -217,6 +234,86 @@ once a GPU backend exists, and it needs a quality check alongside it.
 - Not confirmed: whether Mirage / MPK support training, and the current state
   of `sac_ilp.py` in PyTorch.
 - The FLOP figures in §2.1 and the gains in §2 are back-of-envelope estimates.
+
+---
+
+## 7. T4 measurements (2026-11-23)
+
+Script: [`benchmarks/t4_profile.py`](benchmarks/t4_profile.py). Raw output:
+[`benchmarks/t4/2026-11-23_colab_t4.md`](benchmarks/t4/2026-11-23_colab_t4.md).
+One Colab T4, PyTorch 2.14.1 / CUDA 13.0 / Triton 3.8.0, `transformer_base`
+(d_model 512, 6 + 6 layers, d_ff 2048, 16k vocab), batch 64 × 64 source and
+target tokens, fp16 + GradScaler, fused AdamW. This measures **PyTorch
+only**: houssem_torch has no GPU backend yet.
+
+### 7.1 Step time
+
+| mode | attention `sdpa` | attention `math` |
+|---|---:|---:|
+| eager | 121.5 ms | 152.8 ms |
+| `torch.compile` | **101.3 ms (1.20×)** | 114.7 ms (1.33×) |
+| `reduce-overhead` | 102.3 ms (1.19×) | 117.1 ms (1.30×) |
+
+`sdpa` = PyTorch's fused attention (`fmha_cutlass` memory-efficient kernels
+on sm_75); `math` = explicit `softmax(QKᵀ)V`, the way houssem_torch computes
+it. Compile time on the first step: 41–86 s.
+
+### 7.2 Where the compiled step's time goes (`sdpa`)
+
+| | share of GPU busy time |
+|---|---:|
+| matrix multiplies (cuBLAS) | 49% |
+| residual + dropout + LayerNorm (Inductor-fused) | 13% |
+| AdamW + GradScaler | 11% |
+| attention (backward ~2/3) | 10% |
+| other elementwise, dropout / RNG | 13% |
+| loss (log-softmax / NLL) | 4% |
+| **GPU idle between kernels** | **1% of the span** |
+
+The profiler inflates kernel times (compiled GPU span 125 ms vs 101 ms
+un-profiled), so the shares are reliable and the per-category ms are not.
+
+### 7.3 Findings
+
+1. **Launch overhead is not the problem at this size.** Idle is 1% in every
+   mode, and CUDA graphs (`reduce-overhead`) add nothing over `compile`. The
+   megakernel case has to rest on memory traffic.
+2. **Matrix multiplies are already efficient.** Estimated ~1.3 TFLOP per step
+   (≈ 440 GFLOP forward × 3); at ~48 ms of real matmul time that is
+   ~27 TFLOPS, a good fraction of what a T4 sustains. Beating cuBLAS on
+   plain matrix multiplies is not the goal (§1 still holds).
+3. **About half the compiled step is memory-bound work around the matrix
+   multiplies.** That is the headroom for houssem_torch.
+4. **On a T4, Inductor fuses nothing into matrix multiplies.** Its log says
+   `Not enough SMs to use max_autotune_gemm mode`: Triton GEMM templates (and
+   with them GEMM epilogue / prologue fusion, §1) need a GPU with more SMs
+   than the T4's 40, so every matmul goes to cuBLAS and its output makes a
+   round trip through memory to separate bias / dropout / residual / LayerNorm
+   kernels. A fixed-config engine can fuse those. *To confirm in the Inductor
+   source: the exact SM threshold, and whether default (non-max-autotune)
+   mode ever fuses into GEMMs on any GPU.*
+5. **The logits-free loss is a memory win first.** Head alone (output
+   projection + loss, fwd + bwd): 12.4 ms compiled, 12% of the step. Its
+   three matrix multiplies (~206 GFLOP) take ~7.6 ms of that, leaving ~5 ms of
+   logits traffic, and Cut Cross-Entropy-style kernels recompute the logits in
+   backward (~+2.5 ms). Net speed gain ~2–3%; memory 420 MB → small.
+6. **Fused attention is required from day one.** Explicit attention costs 13%
+   on the compiled step (114.7 vs 101.3 ms) and 26% in eager.
+7. **The optimizer is ~11% per step** and bandwidth-bound (fp32 params, grads,
+   moments for 52.5M parameters ≈ 1.5 GB of traffic). Gradient accumulation
+   divides that share; folding the GradScaler unscale and inf check into the
+   AdamW kernel saves one more pass over the gradients.
+8. **Eager PyTorch's extra cost is mostly fp16 casts and unfused elementwise
+   ops.** Autocast copies each fp32 weight to fp16 on every use (~200 copy
+   kernels per step); compile removes most of them. An engine that keeps an
+   fp16 copy of the weights, refreshed once per optimizer step, avoids them
+   too.
+
+### 7.4 Still to measure
+- The actual training config and batch shape (vocabulary, no attention bias,
+  tokens per batch, gradient accumulation).
+- Several batch sizes: idle time and the head's share depend on them.
+- Repeat runs on Kaggle's T4s to bound the noise (one Colab run so far).
 
 ---
 
