@@ -428,7 +428,7 @@ def run_mode(cfg, args, mode, device, trace_dir):
     loss = step()                       # first call compiles
     sync(device)
     res["first_step_s"] = time.perf_counter() - t0
-    res["loss"] = float(loss)
+    res["loss"] = float(loss.detach())
     for _ in range(args.warmup):
         step()
     if device.type == "cuda":
@@ -566,7 +566,8 @@ def main():
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--profile-steps", type=int, default=5)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="cuda",
+                    help="cpu only for a smoke test with a tiny --config")
     ap.add_argument("--trace-dir", help="keep Chrome traces here")
     ap.add_argument("--out", default="t4_profile_report.md")
     args = ap.parse_args()
@@ -583,6 +584,9 @@ def main():
         raise SystemExit(f"sequence length exceeds max_len {cfg['max_len']}")
 
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("No GPU visible to PyTorch. Colab: Runtime > Change runtime "
+                         "type > T4 GPU. Kaggle: Settings > Accelerator > GPU T4 x2.")
     if device.type == "cuda":
         torch.cuda.set_device(device)
         torch.backends.cuda.matmul.allow_tf32 = False  # T4 has no TF32 anyway
