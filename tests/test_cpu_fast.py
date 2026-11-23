@@ -116,6 +116,48 @@ def test_cross_entropy_matches_reference_and_torch(toggle, label_smoothing):
     np.testing.assert_allclose(grad, lt.grad.numpy(), rtol=1e-4, atol=1e-7)
 
 
+@pytest.mark.parametrize("ignore", [0, None])
+def test_cross_entropy_non_target_smoothing(toggle, ignore):
+    n, v = 40, 300
+    logits = 4 * R.standard_normal((n, v))
+    targets = R.integers(1, v, size=n)
+    targets[::5] = 0     # padding when ignore = 0, a real class when None
+
+    def op(x):
+        return ht.cross_entropy(x, targets, label_smoothing=0.1, ignore_index=ignore,
+                                label_smoothing_mode="non_target")
+    _check_same(toggle, op, [logits], atol=1e-7)
+
+    # Independent PyTorch formula: 1-ε on the target, 0 on pad, ε/K elsewhere.
+    lt = torch.tensor(logits.astype(np.float32), requires_grad=True)
+    t = torch.tensor(targets)
+    log_probs = lt.log_softmax(-1)
+    k = v - 1 - (0 if ignore is None else 1)
+    q = torch.full_like(log_probs, 0.1 / k)
+    q.scatter_(1, t[:, None], 0.9)
+    keep = torch.ones(n)
+    if ignore is not None:
+        q[:, ignore] = 0.0
+        keep = (t != ignore).float()
+    ref = (-(q * log_probs).sum(-1) * keep).sum() / keep.sum()
+    ref.backward()
+    out, (grad,) = toggle(True, lambda: _forward_backward(op, [logits]))
+    assert float(out) == pytest.approx(ref.item(), rel=1e-5)
+    np.testing.assert_allclose(grad, lt.grad.numpy(), rtol=1e-4, atol=1e-7)
+
+
+@pytest.mark.parametrize("padding_idx", [None, 3])
+def test_embedding_padding_idx_fast_and_reference(toggle, padding_idx):
+    vocab, d = 50, 128
+    ids = R.integers(0, vocab, size=(4, 30))
+    ids[:, -5:] = 3
+    w = R.standard_normal((vocab, d))
+    _check_same(toggle, lambda t: ht.embedding(ids, t, padding_idx=padding_idx), [w])
+    _, (grad,) = toggle(True, lambda: _forward_backward(
+        lambda t: ht.embedding(ids, t, padding_idx=padding_idx), [w]))
+    assert grad[3].any() == (padding_idx is None)
+
+
 def test_cross_entropy_all_ignored_gives_zero(toggle):
     logits = R.standard_normal((40, 300))
     targets = np.zeros(40, dtype=np.int64)

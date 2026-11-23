@@ -14,6 +14,9 @@ Layout ("pre-norm": each block normalizes its input first):
 
 One embedding table is shared by the encoder input, the decoder input and
 the output projection (one joint source+target vocabulary).
+
+With norm_position="post" (the original paper) each block normalizes after
+its residual add instead, and the two final LayerNorms are dropped.
 """
 from __future__ import annotations
 from dataclasses import dataclass, asdict, fields
@@ -23,8 +26,11 @@ import numpy as np
 from houssem_torch.autograd import no_grad
 from houssem_torch.nn import (Dropout, Embedding, FeedForward, LayerNorm, Module,
                               ModuleList, MultiHeadAttention)
-from houssem_torch.ops.loss import cross_entropy
+from houssem_torch.nn.embedding import EMBEDDING_INITS
+from houssem_torch.ops.loss import SMOOTHING_MODES, cross_entropy
 from houssem_torch.tensor import Tensor
+
+NORM_POSITIONS = ("pre", "post")
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +51,22 @@ class TransformerConfig:
     activation:       "relu" (original paper) or "gelu".
     label_smoothing:  ε for the loss (paper: 0.1).
     pad_id, bos_id, eos_id: ids of the special tokens.
+
+    Architecture switches (defaults keep earlier configs and checkpoints
+    rebuilding exactly):
+    norm_position:    "pre"  x + Sublayer(LayerNorm(x)), plus one final
+                             LayerNorm per stack (stable without careful warmup);
+                      "post" LayerNorm(x + Sublayer(x)), the original paper,
+                             no final LayerNorm.
+    attention_bias:   bias on the Q/K/V/output projections (paper code: False).
+    ffn_dropout:      dropout between the feed-forward block's two layers;
+                      None = same as `dropout` (paper code: 0.0).
+    label_smoothing_mode: "uniform" (ε/V on every class, PyTorch's) or
+                      "non_target" (ε over the classes other than the target
+                      and padding). See `houssem_torch.cross_entropy`.
+    embedding_init:   "normal" (Normal(0, 1/d)) or "xavier".
+    embedding_padding_idx: if True, pad_id is the embedding's padding_idx:
+                      its row starts at zero and lookups send it no gradient.
     """
     vocab_size: int
     d_model: int = 512
@@ -59,6 +81,12 @@ class TransformerConfig:
     pad_id: int = 0
     bos_id: int = 1
     eos_id: int = 2
+    norm_position: str = "pre"
+    attention_bias: bool = True
+    ffn_dropout: float | None = None
+    label_smoothing_mode: str = "uniform"
+    embedding_init: str = "normal"
+    embedding_padding_idx: bool = False
 
     def __post_init__(self):
         if self.d_model % self.n_heads:
@@ -67,11 +95,26 @@ class TransformerConfig:
         if self.activation not in ("relu", "gelu"):
             raise ValueError(f"activation must be 'relu' or 'gelu', "
                              f"got '{self.activation}'.")
+        choices = {"norm_position": NORM_POSITIONS,
+                   "label_smoothing_mode": SMOOTHING_MODES,
+                   "embedding_init": EMBEDDING_INITS}
+        for key, allowed in choices.items():
+            if getattr(self, key) not in allowed:
+                raise ValueError(f"{key} must be one of {allowed}, "
+                                 f"got {getattr(self, key)!r}.")
+        if self.ffn_dropout is not None and not 0.0 <= self.ffn_dropout < 1.0:
+            raise ValueError(f"ffn_dropout must be in [0, 1) or None, "
+                             f"got {self.ffn_dropout}.")
         specials = (self.pad_id, self.bos_id, self.eos_id)
         if len(set(specials)) != 3 or not all(0 <= s < self.vocab_size
                                               for s in specials):
             raise ValueError(f"pad/bos/eos ids must be distinct and inside the "
                              f"vocabulary, got {specials}.")
+
+    @property
+    def ffn_dropout_rate(self) -> float:
+        """The feed-forward block's inner dropout (ffn_dropout, else dropout)."""
+        return self.dropout if self.ffn_dropout is None else self.ffn_dropout
 
     @classmethod
     def from_dict(cls, values: dict) -> "TransformerConfig":
@@ -118,62 +161,87 @@ def sinusoidal_position_encoding(max_len: int, d_model: int) -> np.ndarray:
 # Layers
 # ---------------------------------------------------------------------------
 
+def residual(x, sublayer, norm, dropout, pre: bool):
+    """One residual block around `sublayer`, dropout on its output.
+
+        pre:  x + dropout(sublayer(norm(x)))
+        post: norm(x + dropout(sublayer(x)))     (the original paper)
+
+    The `x + ...` connection lets information (and gradients) flow straight
+    through the stack, so each layer only learns a refinement.
+    """
+    if pre:
+        return x + dropout(sublayer(norm(x)))
+    return norm(x + dropout(sublayer(x)))
+
+
+def _attention(cfg: TransformerConfig, cross: bool = False) -> MultiHeadAttention:
+    return MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout, cross=cross,
+                              bias=cfg.attention_bias)
+
+
+def _feed_forward(cfg: TransformerConfig) -> FeedForward:
+    return FeedForward(cfg.d_model, cfg.d_ff, cfg.ffn_dropout_rate, cfg.activation)
+
+
 class EncoderLayer(Module):
     """One encoder layer: self-attention block + feed-forward block.
 
+    pre-norm (default):
         x = x + dropout(SelfAttention(LayerNorm(x)))   every word sees every word
         x = x + dropout(FeedForward(LayerNorm(x)))
+    post-norm: x = LayerNorm(x + dropout(Sublayer(x))) for each block.
 
-    The `x + ...` residual connections let information (and gradients) flow
-    straight through the stack, so each layer only learns a refinement.
     Shapes: (B, S, d) -> (B, S, d).
     """
 
     def __init__(self, cfg: TransformerConfig):
+        self.pre = cfg.norm_position == "pre"
         self.norm_attn = LayerNorm(cfg.d_model)
-        self.self_attn = MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout)
+        self.self_attn = _attention(cfg)
         self.norm_ffn = LayerNorm(cfg.d_model)
-        self.ffn = FeedForward(cfg.d_model, cfg.d_ff, cfg.dropout, cfg.activation)
+        self.ffn = _feed_forward(cfg)
         self.dropout = Dropout(cfg.dropout)
 
     def forward(self, x, src_pad_mask=None):
         """src_pad_mask: (B, S) bool, True at source padding positions."""
-        x = x + self.dropout(self.self_attn(self.norm_attn(x),
-                                            key_padding_mask=src_pad_mask))
-        x = x + self.dropout(self.ffn(self.norm_ffn(x)))
-        return x
+        x = residual(x, lambda h: self.self_attn(h, key_padding_mask=src_pad_mask),
+                     self.norm_attn, self.dropout, self.pre)
+        return residual(x, self.ffn, self.norm_ffn, self.dropout, self.pre)
 
 
 class DecoderLayer(Module):
     """One decoder layer: masked self-attention + cross-attention + feed-forward.
 
+    pre-norm (default):
         y = y + dropout(MaskedSelfAttention(LayerNorm(y)))  only earlier target tokens
         y = y + dropout(CrossAttention(LayerNorm(y), memory))  looks at the source
         y = y + dropout(FeedForward(LayerNorm(y)))
+    post-norm: y = LayerNorm(y + dropout(Sublayer(y))) for each block.
 
     Shapes: y (B, T, d), memory (B, S, d) -> (B, T, d).
     """
 
     def __init__(self, cfg: TransformerConfig):
+        self.pre = cfg.norm_position == "pre"
         self.norm_self = LayerNorm(cfg.d_model)
-        self.self_attn = MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout)
+        self.self_attn = _attention(cfg)
         self.norm_cross = LayerNorm(cfg.d_model)
-        self.cross_attn = MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout,
-                                             cross=True)
+        self.cross_attn = _attention(cfg, cross=True)
         self.norm_ffn = LayerNorm(cfg.d_model)
-        self.ffn = FeedForward(cfg.d_model, cfg.d_ff, cfg.dropout, cfg.activation)
+        self.ffn = _feed_forward(cfg)
         self.dropout = Dropout(cfg.dropout)
 
     def forward(self, y, memory, tgt_pad_mask=None, src_pad_mask=None):
         """tgt_pad_mask: (B, T) bool, True at target padding positions.
         src_pad_mask: (B, S) bool, True at source padding positions."""
-        y = y + self.dropout(self.self_attn(self.norm_self(y),
-                                            key_padding_mask=tgt_pad_mask,
-                                            causal=True))
-        y = y + self.dropout(self.cross_attn(self.norm_cross(y), memory=memory,
-                                             key_padding_mask=src_pad_mask))
-        y = y + self.dropout(self.ffn(self.norm_ffn(y)))
-        return y
+        y = residual(y, lambda h: self.self_attn(h, key_padding_mask=tgt_pad_mask,
+                                                 causal=True),
+                     self.norm_self, self.dropout, self.pre)
+        y = residual(y, lambda h: self.cross_attn(h, memory=memory,
+                                                  key_padding_mask=src_pad_mask),
+                     self.norm_cross, self.dropout, self.pre)
+        return residual(y, self.ffn, self.norm_ffn, self.dropout, self.pre)
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +264,26 @@ class Transformer(Module):
 
     def __init__(self, cfg: TransformerConfig):
         self.cfg = cfg
-        self.embedding = Embedding(cfg.vocab_size, cfg.d_model)  # shared table
+        self.embedding = Embedding(  # one table shared by encoder, decoder, output
+            cfg.vocab_size, cfg.d_model, init=cfg.embedding_init,
+            padding_idx=cfg.pad_id if cfg.embedding_padding_idx else None)
         self._pe = sinusoidal_position_encoding(cfg.max_len, cfg.d_model)  # constant
         self.embed_dropout = Dropout(cfg.dropout)
         self.encoder = ModuleList(EncoderLayer(cfg)
                                   for _ in range(cfg.n_encoder_layers))
-        self.encoder_norm = LayerNorm(cfg.d_model)
         self.decoder = ModuleList(DecoderLayer(cfg)
                                   for _ in range(cfg.n_decoder_layers))
-        self.decoder_norm = LayerNorm(cfg.d_model)
+        # Pre-norm leaves the residual stream unnormalized, so each stack ends
+        # with one LayerNorm. Post-norm already ends on one: no extra layer
+        # (and no extra parameters in the state dict).
+        if cfg.norm_position == "pre":
+            self.encoder_norm = LayerNorm(cfg.d_model)
+            self.decoder_norm = LayerNorm(cfg.d_model)
+        else:
+            self.encoder_norm = self.decoder_norm = None
+
+    def _final_norm(self, norm, x):
+        return x if norm is None else norm(x)
 
     # --- building blocks -------------------------------------------------
 
@@ -229,7 +308,7 @@ class Transformer(Module):
         x = self.embed(src)
         for layer in self.encoder:
             x = layer(x, src_pad)
-        return self.encoder_norm(x), src_pad
+        return self._final_norm(self.encoder_norm, x), src_pad
 
     def decode(self, tgt_in, memory, src_pad):
         """Target ids (B, T) + memory -> logits (B, T, V).
@@ -240,7 +319,7 @@ class Transformer(Module):
         y = self.embed(tgt_in)
         for layer in self.decoder:
             y = layer(y, memory, tgt_pad, src_pad)
-        h = self.decoder_norm(y)
+        h = self._final_norm(self.decoder_norm, y)
         B, T, d = h.shape
         logits = h.reshape(B * T, d) @ self.embedding.weight.transpose()
         return logits.reshape(B, T, self.cfg.vocab_size)
@@ -256,7 +335,8 @@ class Transformer(Module):
         """Mean label-smoothed cross-entropy over non-padding target tokens."""
         return cross_entropy(self(src, tgt_in), tgt_out,
                              label_smoothing=self.cfg.label_smoothing,
-                             ignore_index=self.cfg.pad_id)
+                             ignore_index=self.cfg.pad_id,
+                             label_smoothing_mode=self.cfg.label_smoothing_mode)
 
     # --- inference -------------------------------------------------------
 

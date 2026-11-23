@@ -56,10 +56,10 @@ Its items get names `0`, `1`, ….
 |---|---|---|
 | `Linear(in, out)` | `(…, in)` → `(…, out)` | `x @ W + b`; `W` is `(in, out)`, Xavier-initialized; `b` starts at 0 |
 | `LayerNorm(d)` | `(…, d)` → `(…, d)` | normalize each vector to mean 0 / variance 1, then learned scale and shift |
-| `Embedding(V, d)` | ids `(…)` → `(…, d)` | lookup table, one learned vector per token, initialized `N(0, 1/d)` |
+| `Embedding(V, d, padding_idx, init)` | ids `(…)` → `(…, d)` | lookup table, one learned vector per token; `init="normal"` (`N(0, 1/d)`, default) or `"xavier"`; the `padding_idx` row starts at zero and gets no gradient from the lookup |
 | `Dropout(p)` | same shape | zero a fraction `p` while training (rest scaled by `1/(1-p)`); identity in eval |
 | `FeedForward(d, d_ff, dropout, activation)` | `(…, d)` → `(…, d)` | `Linear → relu/gelu → dropout → Linear` |
-| `MultiHeadAttention(d, h, dropout, cross)` | `(B, Tq, d)` → `(B, Tq, d)` | see below |
+| `MultiHeadAttention(d, h, dropout, cross, bias)` | `(B, Tq, d)` → `(B, Tq, d)` | see below |
 
 `Linear` flattens all leading dimensions before multiplying, so `(B, T, d)`
 runs as one `(B·T, d) @ (d, out)` product. That's faster, and the weight
@@ -76,6 +76,11 @@ One class, two layouts:
   keys and values from `memory` (the encoder's output for the source), through
   `w_q (d, d)` and
   `w_kv (d, 2d)`.
+
+Each block of a fused projection (Q, K and V inside `w_qkv`) is
+Xavier-initialized as its own `(d, d)` matrix, so it starts at the same scale
+as a separate layer would. `bias=False` drops the bias of all four
+projections, as in the paper's reference code.
 
 ```python
 attn(x, memory=None, key_padding_mask=None, causal=False)
@@ -165,12 +170,28 @@ model = Transformer(cfg)
 | `label_smoothing` | ε for the loss (paper: 0.1) |
 | `pad_id`, `bos_id`, `eos_id` | special token ids |
 
+Architecture switches. Their defaults are what configs written before the
+switches existed get, so those configs and checkpoints rebuild exactly:
+
+| Field | Default | Other choice |
+|---|---|---|
+| `norm_position` | `"pre"`: `x + Sublayer(LayerNorm(x))`, plus a final LayerNorm per stack | `"post"`: `LayerNorm(x + Sublayer(x))`, the original paper, no final LayerNorm |
+| `attention_bias` | `true` | `false`: no bias on the Q/K/V/output projections |
+| `ffn_dropout` | `null`: same as `dropout` | a rate for the dropout inside the feed-forward block only (paper code: 0.0) |
+| `label_smoothing_mode` | `"uniform"`: ε/V on every class (PyTorch's definition) | `"non_target"`: the target keeps 1 − ε, padding gets 0, ε is spread over the other classes |
+| `embedding_init` | `"normal"`: `N(0, 1/d)` | `"xavier"` |
+| `embedding_padding_idx` | `false` | `true`: `pad_id` is the embedding's `padding_idx` |
+
+The paper's setup is `norm_position: "post"`, `attention_bias: false`,
+`ffn_dropout: 0.0`. Each switch is tested: with the same weights, every
+combination gives the same loss and gradients as a PyTorch implementation.
+
 The config is checked when it loads: unknown keys (typos), indivisible
 widths and clashing special ids are errors, not silent surprises.
 
 ### The layers
 
-**`EncoderLayer`** (pre-norm, with residual connections):
+**`EncoderLayer`** (pre-norm shown, with residual connections):
 ```
 x = x + dropout(SelfAttention(LayerNorm(x)))        every word sees every word
 x = x + dropout(FeedForward(LayerNorm(x)))
@@ -186,7 +207,8 @@ y = y + dropout(FeedForward(LayerNorm(y)))
 The `x + …` residual paths let information and gradients pass straight
 through the stack, so each layer learns a refinement. Normalizing *before*
 each block ("pre-norm") trains more stably from scratch than the paper's
-original "post-norm".
+original "post-norm" (`norm_position: "post"`: `x = LayerNorm(x + dropout(Sublayer(x)))`
+for each block), which is more sensitive to the warmup length.
 
 **`sinusoidal_position_encoding(max_len, d)`** is the paper's fixed sine and
 cosine position signal, added to the embeddings so attention can tell word

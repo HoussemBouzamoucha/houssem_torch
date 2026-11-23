@@ -185,10 +185,14 @@ def log_softmax_backward(g, log_probs):
 # ---------------------------------------------------------------------------
 
 @_jit
-def cross_entropy_forward(logits, targets, valid, label_smoothing):
+def cross_entropy_forward(logits, targets, valid, label_smoothing,
+                          non_target=False, pad=-1):
     """Returns (lse (N,) float64, per-row losses (N,) float64).
 
-    loss_n = (1-ε)·(lse - x[t]) + ε·(lse - mean(x)), 0 for ignored rows.
+    uniform:    loss_n = (1-ε)·(lse - x[t]) + ε·(lse - mean(x))
+    non_target: loss_n = (1-ε)·(lse - x[t]) + ε·(lse - mean of x over the K
+                classes other than t and pad)        (pad = -1: none)
+    0 for ignored rows.
     """
     n, v = logits.shape
     lse = np.empty(n, dtype=np.float64)
@@ -207,30 +211,54 @@ def cross_entropy_forward(logits, targets, valid, label_smoothing):
         lse_r = m + math.log(s)
         lse[r] = lse_r
         if valid[r]:
-            nll = lse_r - logits[r, targets[r]]
-            smooth = lse_r - total / v
+            t = targets[r]
+            nll = lse_r - logits[r, t]
+            if non_target:
+                k = v - 1
+                total -= logits[r, t]
+                if pad >= 0 and pad != t:
+                    k -= 1
+                    total -= logits[r, pad]
+                smooth = lse_r - total / max(k, 1)
+            else:
+                smooth = lse_r - total / v
             losses[r] = (1.0 - label_smoothing) * nll + label_smoothing * smooth
     return lse, losses
 
 
 @_jit
-def cross_entropy_backward(logits, lse, targets, valid, scale, label_smoothing):
+def cross_entropy_backward(logits, lse, targets, valid, scale, label_smoothing,
+                           non_target=False, pad=-1):
     """dL/dlogits = (softmax - q) · scale on valid rows, 0 elsewhere.
 
-    q = ε/V everywhere plus (1-ε) at the target; scale = g / count.
+    uniform:    q = ε/V everywhere plus (1-ε) at the target.
+    non_target: q = (1-ε) at the target, 0 at pad, ε/K on the K others.
+    scale = g / count.
     """
     n, v = logits.shape
     out = np.empty_like(logits)
-    floor = label_smoothing / v
     for r in prange(n):
         if not valid[r]:
             for j in range(v):
                 out[r, j] = 0.0
             continue
+        t = targets[r]
+        if non_target:
+            k = v - 1
+            if pad >= 0 and pad != t:
+                k -= 1
+            floor = label_smoothing / max(k, 1)
+        else:
+            floor = label_smoothing / v
         l_r = lse[r]
         for j in range(v):
             out[r, j] = (math.exp(logits[r, j] - l_r) - floor) * scale
-        out[r, targets[r]] -= (1.0 - label_smoothing) * scale
+        if non_target:
+            out[r, t] += (floor - (1.0 - label_smoothing)) * scale
+            if pad >= 0 and pad != t:
+                out[r, pad] += floor * scale
+        else:
+            out[r, t] -= (1.0 - label_smoothing) * scale
     return out
 
 

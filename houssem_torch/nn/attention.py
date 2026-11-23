@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+from houssem_torch.nn import init
 from houssem_torch.nn.dropout import Dropout
 from houssem_torch.nn.linear import Linear
 from houssem_torch.nn.module import Module
@@ -32,6 +33,18 @@ def build_attention_mask(key_padding_mask=None, causal: bool = False,
     return mask
 
 
+def _fused_projection(d_model: int, parts: int, bias: bool) -> Linear:
+    """One Linear (d, parts·d) holding `parts` separate (d, d) projections
+    side by side (Q|K|V or K|V), each Xavier-initialized as its own (d, d)
+    matrix. One multiply instead of `parts`, same starting scale as separate
+    layers: Xavier over the whole (d, parts·d) block would start them
+    sqrt((parts + 1) / 2) times smaller."""
+    layer = Linear(d_model, parts * d_model, bias=bias)
+    layer.weight.numpy()[...] = np.concatenate(
+        [init.xavier_uniform((d_model, d_model)) for _ in range(parts)], axis=1)
+    return layer
+
+
 class MultiHeadAttention(Module):
     """Multi-head scaled dot-product attention, in one of two layouts.
 
@@ -53,7 +66,9 @@ class MultiHeadAttention(Module):
     """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0,
-                 cross: bool = False):
+                 cross: bool = False, bias: bool = True):
+        """bias=False drops the bias of all four projections (Q, K, V, output),
+        as in the paper's reference code and many PyTorch models."""
         if d_model % n_heads:
             raise ValueError(f"d_model ({d_model}) must be divisible by "
                              f"n_heads ({n_heads}).")
@@ -62,11 +77,11 @@ class MultiHeadAttention(Module):
         self.d_k = d_model // n_heads
         self.cross = cross
         if cross:
-            self.w_q = Linear(d_model, d_model)
-            self.w_kv = Linear(d_model, 2 * d_model)
+            self.w_q = Linear(d_model, d_model, bias=bias)
+            self.w_kv = _fused_projection(d_model, 2, bias)
         else:
-            self.w_qkv = Linear(d_model, 3 * d_model)
-        self.w_o = Linear(d_model, d_model)
+            self.w_qkv = _fused_projection(d_model, 3, bias)
+        self.w_o = Linear(d_model, d_model, bias=bias)
         self.attn_dropout = Dropout(dropout)
 
     def _split_heads(self, t):

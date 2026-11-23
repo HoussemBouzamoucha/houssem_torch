@@ -186,7 +186,8 @@ def softmax_backward(g: np.ndarray, probs: np.ndarray, axis: int) -> np.ndarray:
 
 def cross_entropy_backward(g: np.ndarray, log_probs: np.ndarray,
                            targets: np.ndarray, valid: np.ndarray, count: int,
-                           label_smoothing: float) -> np.ndarray:
+                           label_smoothing: float, non_target: bool = False,
+                           pad: int | None = None) -> np.ndarray:
     """Forward recap (N positions, V classes):
         p = softmax(logits) row-wise, log_probs = log p,       (N, V)
         q = target distribution: (1-ε)·one_hot(target) + ε/V    (N, V)
@@ -204,16 +205,38 @@ def cross_entropy_backward(g: np.ndarray, log_probs: np.ndarray,
           zero the rows where `valid` is False, divide by `count`
           (use max(count, 1)), and multiply by g.
           Build q with np.full(..., ε/V) and add (1-ε) at the targets.
+
+    non_target=True switches q to the "non_target" smoothing: (1-ε) at the
+    target, 0 at `pad` (the ignore_index, or None), and ε spread evenly over
+    the K remaining classes. The gradient is still p - q.
     """
     n, vocab = log_probs.shape
-    # d loss_n / d logits = p - q   (prediction minus target), with
-    # q = ε/V everywhere plus (1-ε) at the target: subtract the two parts
-    # in place instead of building q.
+    rows = np.arange(n)
+    # d loss_n / d logits = p - q   (prediction minus target): subtract the
+    # parts of q in place instead of building it.
     dlogits = np.exp(log_probs)
-    dlogits -= label_smoothing / vocab
-    dlogits[np.arange(n), targets] -= 1.0 - label_smoothing
+    if non_target:
+        w = (label_smoothing / non_target_counts(vocab, targets, pad))
+        w = w.astype(dlogits.dtype)
+        dlogits -= w[:, None]
+        dlogits[rows, targets] += w - (1.0 - label_smoothing)
+        if pad is not None:
+            other = targets != pad          # pad == target: already handled
+            dlogits[rows[other], pad] += w[other]
+    else:
+        dlogits -= label_smoothing / vocab
+        dlogits[rows, targets] -= 1.0 - label_smoothing
     dlogits *= (valid * (g / max(count, 1)))[:, None].astype(dlogits.dtype)
     return dlogits                                # padding rows -> 0
+
+
+def non_target_counts(vocab: int, targets: np.ndarray, pad: int | None) -> np.ndarray:
+    """K per row for "non_target" smoothing: classes other than the target
+    and `pad`. (N,) float64, at least 1."""
+    k = np.full(targets.shape, vocab - 1, dtype=np.float64)
+    if pad is not None:
+        k -= targets != pad
+    return np.maximum(k, 1.0)
 
 
 # ---------------------------------------------------------------------------

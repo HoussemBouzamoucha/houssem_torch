@@ -160,6 +160,52 @@ def test_cross_entropy_matches_torch(smoothing, ignore):
     close(out, expected, rtol=1e-5, atol=1e-5)
 
 
+def torch_non_target_ce(logits, targets, eps, pad):
+    """1-eps on the target, 0 on pad (None: no pad class), eps/K on the K others."""
+    log_probs = logits.log_softmax(-1)
+    n, v = logits.shape
+    rows = torch.arange(n)
+    q = torch.zeros_like(log_probs)
+    for r in range(n):
+        others = [c for c in range(v) if c != targets[r] and c != pad]
+        q[r, others] = eps / len(others)
+    q[rows, targets] = 1.0 - eps
+    keep = torch.ones(n) if pad is None else (targets != pad).float()
+    return (-(q * log_probs).sum(-1) * keep).sum() / keep.sum()
+
+
+@pytest.mark.parametrize("ignore", [None, 0, 4])
+def test_cross_entropy_non_target_smoothing_matches_torch(ignore):
+    N, V = 12, 9
+    logits = rand(N, V, scale=2.0)
+    targets = rng.integers(0, V, size=N)
+    if ignore is not None:
+        targets[::4] = ignore
+    xh = ht.tensor(logits, requires_grad=True)
+    out = ht.cross_entropy(xh, targets, label_smoothing=0.2, ignore_index=ignore,
+                           label_smoothing_mode="non_target")
+    out.backward()
+    xt = torch.tensor(logits, requires_grad=True)
+    expected = torch_non_target_ce(xt, torch.tensor(targets), 0.2, ignore)
+    expected.backward()
+    close(out, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(xh.grad.numpy(), xt.grad.numpy(), rtol=1e-4, atol=1e-6)
+
+
+def test_non_target_smoothing_without_smoothing_is_plain_cross_entropy():
+    logits, targets = rand(6, 7), rng.integers(1, 7, size=6)
+    a = ht.cross_entropy(ht.tensor(logits), targets, ignore_index=0)
+    b = ht.cross_entropy(ht.tensor(logits), targets, ignore_index=0,
+                         label_smoothing_mode="non_target")
+    assert float(a.numpy()) == float(b.numpy())
+
+
+def test_cross_entropy_rejects_unknown_smoothing_mode():
+    with pytest.raises(ValueError):
+        ht.cross_entropy(ht.tensor(rand(2, 5)), np.array([1, 2]),
+                         label_smoothing_mode="nope")
+
+
 def test_cross_entropy_rejects_mismatched_targets():
     with pytest.raises(ValueError):
         ht.cross_entropy(ht.tensor(rand(2, 3, 5)), np.zeros((2, 4), dtype=np.int64))

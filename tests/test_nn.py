@@ -143,6 +143,64 @@ def test_attention_matches_torch(cross, causal, padded):
     np.testing.assert_allclose(xh.grad.numpy(), xt.grad.numpy(), rtol=1e-4, atol=1e-5)
 
 
+def test_embedding_padding_idx_matches_torch_with_tied_output():
+    """The lookup sends the pad row nothing; a tied output projection still does."""
+    emb = nn.Embedding(7, 4, padding_idx=0)
+    assert not emb.weight.numpy()[0].any()                 # starts at zero
+    w0, up = rand(7, 4), rand(2, 3, 7)
+    emb.weight.numpy()[...] = w0
+    ids = np.array([[0, 2, 5], [3, 0, 0]])
+
+    emb(ids).sum().backward()                              # lookup only
+    assert not emb.weight.grad.numpy()[0].any()
+
+    emb.zero_grad()                                        # lookup + tied output
+    ((emb(ids) @ emb.weight.transpose()) * ht.tensor(up)).sum().backward()
+    w_t = torch.tensor(w0, requires_grad=True)
+    x_t = torch.nn.functional.embedding(torch.tensor(ids), w_t, padding_idx=0)
+    ((x_t @ w_t.T) * torch.tensor(up)).sum().backward()
+    np.testing.assert_allclose(emb.weight.grad.numpy(), w_t.grad.numpy(),
+                               rtol=1e-5, atol=1e-6)
+    assert emb.weight.grad.numpy()[0].any()
+
+
+def test_embedding_init_options():
+    ht.manual_seed(0)
+    xav = nn.Embedding(1000, 24, init="xavier").weight.numpy()
+    limit = np.sqrt(6 / (1000 + 24))
+    assert np.abs(xav).max() <= limit and np.abs(xav).max() > 0.95 * limit
+    with pytest.raises(ValueError):
+        nn.Embedding(10, 4, init="zeros")
+    with pytest.raises(ValueError):
+        nn.Embedding(10, 4, padding_idx=10)
+
+
+@pytest.mark.parametrize("cross", [False, True])
+def test_fused_projections_start_like_separate_layers(cross):
+    """Each Q/K/V block is Xavier over its own (d, d), not over (d, 3d)."""
+    ht.manual_seed(0)
+    d = 64
+    attn = nn.MultiHeadAttention(d, 4, cross=cross)
+    fused = (attn.w_kv if cross else attn.w_qkv).weight.numpy()
+    limit = np.sqrt(6 / (2 * d))
+    for block in np.split(fused, fused.shape[1] // d, axis=1):
+        assert np.abs(block).max() <= limit
+        assert np.abs(block).max() > 0.95 * limit
+        assert block.std() == pytest.approx(limit / np.sqrt(3), rel=0.05)
+
+
+def test_attention_bias_false_has_no_biases_and_matches_zero_bias():
+    ht.manual_seed(0)
+    no_bias = nn.MultiHeadAttention(8, 2, bias=False)
+    assert all(not n.endswith("bias") for n, _ in no_bias.named_parameters())
+    ht.manual_seed(0)
+    with_bias = nn.MultiHeadAttention(8, 2)
+    for n, p in no_bias.named_parameters():
+        dict(with_bias.named_parameters())[n].numpy()[...] = p.numpy()
+    x = ht.tensor(rand(2, 5, 8))
+    np.testing.assert_allclose(no_bias(x).numpy(), with_bias(x).numpy(), rtol=1e-6)
+
+
 def test_attention_rejects_misuse():
     with pytest.raises(ValueError):
         nn.MultiHeadAttention(10, 3)
