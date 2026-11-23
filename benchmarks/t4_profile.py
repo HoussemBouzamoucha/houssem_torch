@@ -588,6 +588,8 @@ def main():
         raise SystemExit("No GPU visible to PyTorch. Colab: Runtime > Change runtime "
                          "type > T4 GPU. Kaggle: Settings > Accelerator > GPU T4 x2.")
     if device.type == "cuda":
+        if device.index is None:  # plain "cuda": use the first GPU
+            device = torch.device("cuda", 0)
         torch.cuda.set_device(device)
         torch.backends.cuda.matmul.allow_tf32 = False  # T4 has no TF32 anyway
     trace_dir = args.trace_dir or tempfile.mkdtemp(prefix="t4_profile_")
