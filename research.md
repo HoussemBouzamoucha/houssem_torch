@@ -390,6 +390,42 @@ Findings:
 Together 1–3 put the step at ~75–85 ms against `torch.compile`'s 100.7 ms,
 which matches the §7.5 estimate. Length buckets (§7.5.4) come on top.
 
+### 7.7 Fused attention + vectorized kernels: faster than `torch.compile` (2026-11-24)
+
+Raw output: [`benchmarks/t4/2026-11-24_kaggle_t4_fused_vs_torch.md`](benchmarks/t4/2026-11-24_kaggle_t4_fused_vs_torch.md).
+Same session, same real batches, same initial weights; PyTorch is
+`torch.compile` with `sdpa` attention, fused AdamW and AMP.
+
+| batch | houssem_torch | `torch.compile` | eager | speedup vs compile |
+|---:|---:|---:|---:|---:|
+| 32 | 45.8 ms | 56.5 ms | 68.5 ms | 1.24× |
+| 64 | 84.1 ms | 101.7 ms | 123.1 ms | 1.21× |
+| 96 | 121.3 ms | 160.5 ms | 183.8 ms | 1.32× |
+
+3000 training steps: 276 s vs 335 s, identical loss curves (val 4.771 vs
+4.782). Setup 0.5 s vs 34.5 s compile; memory 2.03 vs 2.19 GB.
+
+Findings:
+1. **The thesis holds on a T4:** a startup-specialized whole step beats
+   `torch.compile` by 1.2–1.3× on the same model, without giving up
+   accuracy, mostly through fusion Inductor can't do on 40 SMs.
+2. **Memory-bound work is now ~2× cheaper than Inductor's** in every
+   category (LayerNorm + residual 5.3 vs 11.5 ms, activation / dropout /
+   bias 5.4 vs 12.7, loss 1.1 vs 4.6, optimizer 7.6 vs 11.5).
+3. **Attention is the one category we lose:** 16.8 ms vs `sdpa`'s 10.2
+   (down from 27 ms unfused). The backward kernel needs 55 KB of shared
+   memory, so one 4-warp block runs per SM; B-fragment loads from shared
+   memory are uncoalesced 16-bit reads with bank conflicts. Next: ldmatrix
+   loads, a split of the backward into smaller-footprint passes (or dK/dV
+   per key tile with atomics-free accumulation) for 2+ blocks per SM.
+   Closing the gap is worth ~6 ms (→ ~1.3× compile).
+4. **Matmuls are the floor:** 46.7 ms of the 84 is cuBLAS; further wins
+   come from GEMM-epilogue fusion and from not doing padded work (length
+   buckets, §7.5.4).
+5. Caveat: each engine ran on its own T4 (cuda:0 vs cuda:1);
+   `torch.compile` matches its earlier single-GPU numbers (100.7 ms), but a
+   swapped-GPU run would rule out card-to-card differences entirely.
+
 ---
 
 ## Sources

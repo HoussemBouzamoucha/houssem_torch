@@ -285,9 +285,11 @@ def free_gpu():
 # %% Cell 9: same model? loss of both engines on one batch, dropout off
 probe = val_batches[0]
 ht_step, ht_build_s = build_ht()
-fused = sorted(ht_step.k_attn)
-print(f"houssem_torch attention: fused tensor-core kernels for "
-      f"{len(fused)}/3 shapes {fused} (query len, key len, causal)")
+kinds = {"encoder self-attention": (SRC_LEN, SRC_LEN, 0),
+         "decoder self-attention": (TGT_LEN, TGT_LEN, 1),
+         "cross-attention": (TGT_LEN, SRC_LEN, 0)}
+print("houssem_torch attention: " + ", ".join(
+    f"{k} {'fused' if v in ht_step.k_attn else 'UNFUSED'}" for k, v in kinds.items()))
 ht_eval = ht_step.evaluate(*probe)
 tm, _, _ = build_torch(init_state)
 tm.eval()
