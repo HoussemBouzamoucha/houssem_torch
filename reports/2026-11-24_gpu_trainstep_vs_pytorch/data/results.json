@@ -1,0 +1,272 @@
+{
+  "_about": "Measured results behind README.md, copied from the Kaggle runs of 2026-11-24 (raw outputs in benchmarks/t4/). Times in ms per training step unless noted.",
+  "setup": {
+    "gpu": "Tesla T4 (sm_75, 40 SMs, 16 GB), Kaggle 2 x T4, driver 580.178",
+    "pytorch": "2.11.0+cu130",
+    "model": "transformer_base: d_model 512, 8 heads, d_ff 2048, 6+6 layers, pre-norm, shared 16384-token embedding",
+    "parameters": 52529152,
+    "batch": "64 sentences x 64 source / 64 target tokens (padded), fp16 mixed precision",
+    "target_tokens_per_batch": 1471,
+    "data": "opus_books fr->en, 115790 training pairs that fit 64/64 tokens",
+    "optimizer": "AdamW (0.9, 0.98), eps 1e-9, weight decay 0.01, clip 1.0, Noam schedule (warmup 2000), dynamic loss scaling"
+  },
+  "final_run": {
+    "commit": "839ffd6",
+    "gpus": "houssem_torch on cuda:0, PyTorch on cuda:1, same session",
+    "tests_on_t4": "32 passed",
+    "eval_loss_same_weights": {
+      "houssem_fp16": 10.32006,
+      "torch_fp32": 10.31998,
+      "torch_fp16": 10.32001
+    },
+    "step_ms": {
+      "32": {
+        "houssem_torch": 45.8,
+        "torch.compile": 56.5,
+        "PyTorch eager": 68.5
+      },
+      "64": {
+        "houssem_torch": 84.1,
+        "torch.compile": 101.7,
+        "PyTorch eager": 123.1
+      },
+      "96": {
+        "houssem_torch": 121.3,
+        "torch.compile": 160.5,
+        "PyTorch eager": 183.8
+      }
+    },
+    "tokens_per_s_batch64": {
+      "houssem_torch": 17493,
+      "torch.compile": 14465,
+      "PyTorch eager": 11957
+    },
+    "setup_s": {
+      "houssem_torch": 0.5,
+      "torch.compile": 34.5,
+      "PyTorch eager": 0.2
+    },
+    "memory_gb": {
+      "houssem_torch": 2.03,
+      "torch.compile": 2.19,
+      "PyTorch eager": 2.68
+    },
+    "breakdown_ms_batch64": {
+      "categories": [
+        "matrix multiplies",
+        "attention",
+        "LayerNorm + residual",
+        "activation, dropout, bias",
+        "loss",
+        "optimizer",
+        "embedding, other"
+      ],
+      "houssem_torch": [
+        46.7,
+        16.8,
+        5.3,
+        5.4,
+        1.1,
+        7.6,
+        1.1
+      ],
+      "torch.compile": [
+        50.9,
+        10.2,
+        11.5,
+        12.7,
+        4.6,
+        11.5,
+        0.4
+      ],
+      "PyTorch eager": [
+        48.1,
+        17.4,
+        5.4,
+        42.4,
+        0.0,
+        9.4,
+        0.4
+      ]
+    },
+    "training": {
+      "steps": 3000,
+      "houssem_torch": {
+        "wall_s": 276.5,
+        "val_loss": 4.7712,
+        "log": [
+          [
+            250,
+            7.397,
+            21.9
+          ],
+          [
+            500,
+            6.8128,
+            44.5
+          ],
+          [
+            750,
+            6.5399,
+            67.6
+          ],
+          [
+            1000,
+            6.2478,
+            91.3
+          ],
+          [
+            1250,
+            5.9917,
+            114.5
+          ],
+          [
+            1500,
+            5.6067,
+            137.5
+          ],
+          [
+            1750,
+            5.6437,
+            160.7
+          ],
+          [
+            2000,
+            5.3405,
+            183.9
+          ],
+          [
+            2250,
+            5.1142,
+            207.0
+          ],
+          [
+            2500,
+            5.1869,
+            230.1
+          ],
+          [
+            2750,
+            4.9731,
+            253.3
+          ],
+          [
+            3000,
+            5.0159,
+            276.5
+          ]
+        ]
+      },
+      "torch.compile": {
+        "wall_s": 335.3,
+        "val_loss": 4.7815,
+        "log": [
+          [
+            250,
+            7.3922,
+            27.4
+          ],
+          [
+            500,
+            6.8141,
+            54.3
+          ],
+          [
+            750,
+            6.5327,
+            83.2
+          ],
+          [
+            1000,
+            6.2477,
+            112.0
+          ],
+          [
+            1250,
+            5.9844,
+            139.7
+          ],
+          [
+            1500,
+            5.5951,
+            167.5
+          ],
+          [
+            1750,
+            5.6409,
+            195.6
+          ],
+          [
+            2000,
+            5.3193,
+            223.6
+          ],
+          [
+            2250,
+            5.1248,
+            251.4
+          ],
+          [
+            2500,
+            5.2107,
+            279.4
+          ],
+          [
+            2750,
+            4.9936,
+            307.4
+          ],
+          [
+            3000,
+            5.0433,
+            335.3
+          ]
+        ]
+      }
+    },
+    "speedup_vs_compile_reported": {
+      "32": 1.24,
+      "64": 1.21,
+      "96": 1.32
+    }
+  },
+  "history": {
+    "_note": "Each version's speed is relative to torch.compile timed in the same session (T4 clocks vary ~10% between sessions).",
+    "versions": [
+      {
+        "name": "v1: compiled step, unfused attention",
+        "commit": "0af6946",
+        "houssem_ms": 101.8,
+        "compile_ms": 100.7,
+        "eager_ms": 120.9
+      },
+      {
+        "name": "v2: fused attention + vectorized kernels",
+        "commit": "839ffd6",
+        "houssem_ms": 84.1,
+        "compile_ms": 101.7,
+        "eager_ms": 123.1
+      }
+    ],
+    "v1_profile_ms": {
+      "_session_step_ms": 111.4,
+      "matmul: linear layers": 45.22,
+      "head split / merge": 13.84,
+      "matmul: attention (QK^T, PV)": 10.74,
+      "optimizer": 8.95,
+      "residual + dropout + LayerNorm": 7.84,
+      "FFN bias + activation + dropout": 7.4,
+      "matmul: output projection": 6.98,
+      "loss": 4.03,
+      "matmul: bias gradients": 3.48,
+      "attention softmax": 2.78,
+      "memset": 0.94,
+      "embedding backward": 0.18
+    },
+    "attention_ms": {
+      "v1 (unfused)": 27.4,
+      "v2 (fused)": 16.8,
+      "torch.compile (sdpa)": 10.2
+    }
+  }
+}
