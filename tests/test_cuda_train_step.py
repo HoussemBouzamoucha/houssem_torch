@@ -178,7 +178,10 @@ def test_dropout_changes_loss_but_eval_does_not():
     b = step.evaluate(src, tgt_in, tgt_out)
     model.eval()
     ref = float(model.loss(src, tgt_in, tgt_out).numpy())
-    assert a == b == pytest.approx(ref, rel=1e-5)
+    # The loss is summed with float atomics, whose order varies run to run:
+    # equal to rounding, not bit for bit.
+    assert a == pytest.approx(b, rel=1e-6)
+    assert a == pytest.approx(ref, rel=1e-5)
     step.forward_backward(src, tgt_in, tgt_out)
     assert step.last_loss() != pytest.approx(ref, rel=1e-4)
 
