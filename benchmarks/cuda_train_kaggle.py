@@ -16,7 +16,8 @@
 # Kaggle settings: Accelerator "GPU T4 x2", Internet "On".
 # Run the cells top to bottom (each `# %%` block is one notebook cell), or
 # the whole file with `!python cuda_train_kaggle.py`.
-# Outputs in /kaggle/working: cuda_vs_torch_report.md, checkpoints, tokenizer.
+# Outputs in /kaggle/working: houssem_vs_torch.png (the summary chart),
+# cuda_vs_torch_report.md, checkpoints, tokenizer.
 
 # %% Cell 1: settings
 REPO_URL = "https://github.com/HoussemBouzamoucha/houssem_torch.git"
@@ -30,6 +31,8 @@ VAL_FRACTION = 0.02
 SEED = 0
 
 BENCH_WARMUP, BENCH_STEPS, BENCH_REPEATS = 10, 30, 3
+BENCH_BATCHES = [32, 64, 96]    # speed sweep (BATCH must be one of them)
+PROFILE_STEPS = 5               # steps per engine for the time breakdown
 TRAIN_STEPS = 3000              # per engine; ~1,900 steps = one epoch
 WARMUP_STEPS, LR_FACTOR = 2000, 1.0     # Noam schedule
 MAX_GRAD_NORM = 1.0
@@ -143,9 +146,10 @@ print(f"kept {len(train_ids):,}/{len(train_pairs):,} train pairs that fit "
 
 
 def to_batch(chunk):
-    src = np.full((BATCH, SRC_LEN), PAD, np.int64)
-    tgt_in = np.full((BATCH, TGT_LEN), PAD, np.int64)
-    tgt_out = np.full((BATCH, TGT_LEN), PAD, np.int64)
+    B = len(chunk)
+    src = np.full((B, SRC_LEN), PAD, np.int64)
+    tgt_in = np.full((B, TGT_LEN), PAD, np.int64)
+    tgt_out = np.full((B, TGT_LEN), PAD, np.int64)
     for i, (s, t) in enumerate(chunk):
         src[i, :len(s)] = s
         tgt_in[i, 0], tgt_in[i, 1:len(t) + 1] = BOS, t
@@ -153,11 +157,11 @@ def to_batch(chunk):
     return src, tgt_in, tgt_out
 
 
-def batches(data, epoch_seed):
+def batches(data, epoch_seed, B=BATCH):
     """Full batches only (the GPU step has a fixed shape), shuffled per epoch."""
     idx = np.random.default_rng(epoch_seed).permutation(len(data))
-    for i in range(0, len(idx) - BATCH + 1, BATCH):
-        yield to_batch([data[j] for j in idx[i:i + BATCH]])
+    for i in range(0, len(idx) - B + 1, B):
+        yield to_batch([data[j] for j in idx[i:i + B]])
 
 
 def train_stream(n_steps):
@@ -234,6 +238,8 @@ def build_torch(state):
 
 
 def torch_step_fn(model, opt, scaler, mode):
+    if mode != "eager":
+        torch._dynamo.reset()      # fresh compile for each model / shape
     loss_fn = model.loss if mode == "eager" else torch.compile(model.loss)
 
     def step(batch, lr):
@@ -255,10 +261,10 @@ def to_torch(batch):
     return tuple(torch.from_numpy(a).to(torch_dev, non_blocking=True) for a in batch)
 
 
-def build_ht():
+def build_ht(B=BATCH):
     cpu_model.load_state_dict(init_state)
     t0 = time.perf_counter()
-    step = TrainStep(cpu_model, BATCH, SRC_LEN, TGT_LEN, precision="fp16",
+    step = TrainStep(cpu_model, B, SRC_LEN, TGT_LEN, precision="fp16",
                      max_grad_norm=MAX_GRAD_NORM, seed=SEED, device=HT_GPU, **ADAM)
     drv.synchronize()
     return step, time.perf_counter() - t0
@@ -286,10 +292,11 @@ assert abs(ht_eval - torch_fp32) < 2e-2 * torch_fp32, "engines disagree"
 del tm, ht_step
 free_gpu()
 
-# %% Cell 10: speed benchmark (ms per training step, same real batches)
-bench_batches = [b for _, b in zip(range(BENCH_WARMUP + BENCH_STEPS),
-                                   batches(train_ids, SEED + 99))]
-bench_tokens = np.mean([(b[2] != PAD).sum() for b in bench_batches])
+# %% Cell 10: speed benchmark: ms per training step, several batch sizes
+# Same real batches for every engine. torch.compile recompiles for each batch
+# size (its first step, "setup", includes that).
+HT, TC, TE = "houssem_torch", "torch.compile", "PyTorch eager"
+ENGINES = (HT, TC, TE)
 
 
 def time_engine(run_step, data, sync):
@@ -307,40 +314,123 @@ def time_engine(run_step, data, sync):
     return float(np.median(runs))
 
 
-results = {}
-ht_step, ht_build_s = build_ht()
-ms = time_engine(lambda b, st=ht_step: st(*b, lr=1e-4), bench_batches,
-                 drv.synchronize)
-results["houssem_torch TrainStep (fp16)"] = dict(
-    ms=ms, setup_s=ht_build_s, mem_gb=drv.memory_in_use() / 2 ** 30)
-del ht_step
-free_gpu()
+def torch_sync():
+    torch.cuda.synchronize(torch_dev)
 
-for mode in ("eager", "compile"):
+
+sweep = {}          # sweep[B][engine] = dict(ms, tok_s, setup_s, mem_gb)
+bench_data = {}
+for B in BENCH_BATCHES:
+    data = [b for _, b in zip(range(BENCH_WARMUP + BENCH_STEPS),
+                              batches(train_ids, SEED + 99, B))]
+    bench_data[B] = data
+    tokens = float(np.mean([(b[2] != PAD).sum() for b in data]))
+    row = sweep[B] = {}
+    step, setup = build_ht(B)
+    ms = time_engine(lambda b, st=step: st(*b, lr=1e-4), data, drv.synchronize)
+    row[HT] = dict(ms=ms, setup_s=setup, mem_gb=drv.memory_in_use() / 2 ** 30)
+    del step
+    free_gpu()
+    for name, mode in ((TE, "eager"), (TC, "compile")):
+        model, opt, scaler = build_torch(init_state)
+        step = torch_step_fn(model, opt, scaler, mode)
+        tb = [to_torch(b) for b in data]
+        torch.cuda.reset_peak_memory_stats(torch_dev)
+        t0 = time.perf_counter()
+        step(tb[0], 1e-4)                         # includes compile time
+        torch_sync()
+        setup = time.perf_counter() - t0
+        ms = time_engine(lambda b, st=step: st(b, 1e-4), tb, torch_sync)
+        row[name] = dict(ms=ms, setup_s=setup,
+                         mem_gb=torch.cuda.max_memory_allocated(torch_dev) / 2 ** 30)
+        del model, opt, scaler, step, tb
+        free_gpu()
+    for r in row.values():
+        r["tok_s"] = tokens / (r["ms"] / 1e3)
+    print(f"batch {B:4d}: " + "  ".join(f"{e} {row[e]['ms']:.1f} ms"
+                                        for e in ENGINES), flush=True)
+results = sweep[BATCH]
+bench_tokens = float(np.mean([(b[2] != PAD).sum() for b in bench_data[BATCH]]))
+
+# %% Cell 10b: where the time goes (same categories for every engine)
+# Each engine's GPU time is grouped into the same kinds of work, then scaled
+# to its measured (unprofiled) ms/step, so its bars add up to its step time.
+import trainstep_profile as htp
+
+BUCKETS = ("matrix multiplies", "attention", "LayerNorm + residual",
+           "activation, dropout, bias", "loss", "optimizer", "embedding, other")
+
+
+def bucket_houssem(cat):
+    if "attention" in cat or "head split" in cat:
+        return "attention"
+    if cat.startswith("matmul"):
+        return "matrix multiplies"
+    if cat.startswith("residual"):
+        return "LayerNorm + residual"
+    if cat.startswith("FFN"):
+        return "activation, dropout, bias"
+    if cat.startswith("loss"):
+        return "loss"
+    if cat.startswith("optimizer"):
+        return "optimizer"
+    return "embedding, other"
+
+
+def bucket_torch(cat):
+    if cat == "matmul":
+        return "matrix multiplies"
+    if cat in ("attention", "softmax"):
+        return "attention"
+    if cat == "layernorm":
+        return "LayerNorm + residual"
+    if cat.startswith("dropout") or cat.startswith("other"):
+        return "activation, dropout, bias"
+    if cat.startswith("loss"):
+        return "loss"
+    if cat.startswith("optimizer"):
+        return "optimizer"
+    return "embedding, other"
+
+
+def scaled(raw, ms):
+    total = sum(raw.values()) or 1.0
+    return {k: raw.get(k, 0.0) / total * ms for k in BUCKETS}
+
+
+breakdown = {}
+data = bench_data[BATCH]
+step, _ = build_ht()
+for b in data[:BENCH_WARMUP]:
+    step(*b, lr=1e-4)
+with drv.Profiler() as prof:
+    for b in data[:PROFILE_STEPS]:
+        step(*b, lr=1e-4)
+raw = {}
+for r in prof.records():
+    k = bucket_houssem(htp.category(r))
+    raw[k] = raw.get(k, 0.0) + r.ms / PROFILE_STEPS
+breakdown[HT] = scaled(raw, results[HT]["ms"])
+del step, prof
+free_gpu()
+for name, mode in ((TC, "compile"), (TE, "eager")):
     model, opt, scaler = build_torch(init_state)
     step = torch_step_fn(model, opt, scaler, mode)
-    torch.cuda.reset_peak_memory_stats(torch_dev)
-    t0 = time.perf_counter()
-    step(to_torch(bench_batches[0]), 1e-4)        # includes compile time
-    torch.cuda.synchronize(torch_dev)
-    setup = time.perf_counter() - t0
-    tb = [to_torch(b) for b in bench_batches]
-    ms = time_engine(lambda b, st=step: st(b, 1e-4), tb,
-                     lambda: torch.cuda.synchronize(torch_dev))
-    results[f"PyTorch {mode} (AMP fp16)"] = dict(
-        ms=ms, setup_s=setup,
-        mem_gb=torch.cuda.max_memory_allocated(torch_dev) / 2 ** 30)
+    tb = to_torch(data[0])
+    for _ in range(3):
+        step(tb, 1e-4)
+    prof = tp.profile_steps(lambda st=step, tb=tb: st(tb, 1e-4), PROFILE_STEPS,
+                            f"{WORK}/trace_{mode}.json")
+    raw = {}
+    for cat, ms in (prof or {}).get("categories", {}).items():
+        k = bucket_torch(cat)
+        raw[k] = raw.get(k, 0.0) + ms
+    breakdown[name] = scaled(raw, results[name]["ms"])
     del model, opt, scaler, step, tb
     free_gpu()
-
-best_torch = min(v["ms"] for k, v in results.items() if k.startswith("PyTorch"))
-print(f"\n{'engine':34s} {'ms/step':>9s} {'tok/s':>9s} {'vs best torch':>14s} "
-      f"{'setup s':>8s} {'mem GB':>7s}")
-for name, r in results.items():
-    r["tok_s"] = bench_tokens / (r["ms"] / 1e3)
-    r["speedup"] = best_torch / r["ms"]
-    print(f"{name:34s} {r['ms']:9.1f} {r['tok_s']:9.0f} {r['speedup']:13.2f}x "
-          f"{r['setup_s']:8.1f} {r['mem_gb']:7.2f}")
+print(f"{'ms per step':28s}" + "".join(f"{e:>16s}" for e in ENGINES))
+for k in BUCKETS:
+    print(f"{k:28s}" + "".join(f"{breakdown[e][k]:16.1f}" for e in ENGINES))
 
 # %% Cell 11: train houssem_torch
 def val_loss_ht(step):
@@ -413,12 +503,127 @@ for (s, t), p in zip(sample, pred):
     translations.append(row)
     print(f"src : {row[0]}\nref : {row[1]}\nhyp : {row[2]}\n")
 
-# %% Cell 14: report
+# %% Cell 14: scoreboard and charts
+import matplotlib.pyplot as plt
+
+ht_ms, tc_ms, te_ms = (results[e]["ms"] for e in ENGINES)
+gpu_name = drv.device_info(HT_GPU).name
+print("=" * 76)
+print(f"  houssem_torch vs PyTorch: {gpu_name}, transformer_base, batch {BATCH}, fp16")
+print("=" * 76)
+print(f"  Speed      houssem_torch {ht_ms:6.1f} ms/step | torch.compile {tc_ms:6.1f}"
+      f" | eager {te_ms:6.1f}")
+print(f"             -> houssem_torch is {tc_ms / ht_ms:.2f}x torch.compile's speed"
+      f" and {te_ms / ht_ms:.2f}x eager's")
+print(f"  Startup    houssem_torch {results[HT]['setup_s']:5.1f} s | torch.compile "
+      f"{results[TC]['setup_s']:5.1f} s (compiling)")
+print(f"  Memory     houssem_torch {results[HT]['mem_gb']:.2f} GB | torch.compile "
+      f"{results[TC]['mem_gb']:.2f} GB")
+print(f"  Training   {TRAIN_STEPS} steps, same data: houssem_torch "
+      f"{ht_run['wall']:.0f} s, val loss {ht_run['val']:.3f} | PyTorch "
+      f"{TORCH_TRAIN_MODE} {torch_run['wall']:.0f} s, val loss {torch_run['val']:.3f}")
+print("=" * 76)
+
+# Light chart theme; one fixed color per engine in every panel.
+SURF, INK, INK2, MUTED, GRID, BASE = ("#fcfcfb", "#0b0b0b", "#52514e", "#898781",
+                                      "#e1e0d9", "#c3c2b7")
+COLOR = {HT: "#2a78d6", TC: "#eb6834", TE: "#1baf7a"}
+plt.rcParams.update({
+    "figure.facecolor": SURF, "axes.facecolor": SURF, "savefig.facecolor": SURF,
+    "axes.edgecolor": BASE, "axes.labelcolor": INK2, "text.color": INK,
+    "xtick.color": MUTED, "ytick.color": INK2, "font.size": 10,
+    "axes.titlesize": 12, "axes.titleweight": "bold", "axes.titlelocation": "left",
+    "axes.spines.top": False, "axes.spines.right": False, "legend.frameon": False,
+})
+
+
+def xgrid(ax):
+    ax.grid(axis="x", color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+
+
+fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+fig.suptitle(f"houssem_torch vs PyTorch on a {gpu_name}: transformer_base "
+             f"({cpu_model.num_parameters() / 1e6:.1f}M parameters), fp16, "
+             f"opus_books {SRC_LANG}->{TGT_LANG}",
+             x=0.01, ha="left", fontsize=14, fontweight="bold")
+
+# (a) time per step
+ax = axs[0, 0]
+order = [TE, TC, HT]                                 # barh draws bottom-up
+vals = [results[e]["ms"] for e in order]
+ax.barh(order, vals, color=[COLOR[e] for e in order], height=0.55)
+for y, (e, v) in enumerate(zip(order, vals)):
+    note = "" if e == HT else f"   ({v / ht_ms:.2f}x houssem_torch's time)"
+    ax.text(v + max(vals) * 0.01, y, f"{v:.1f} ms{note}", va="center",
+            color=INK2, fontsize=9)
+ax.set_xlim(0, max(vals) * 1.6)
+ax.set_xlabel("milliseconds per training step (lower is better)")
+ax.set_title(f"Time per training step, batch {BATCH}")
+xgrid(ax)
+
+# (b) where the time goes: grouped bars per kind of work
+ax = axs[0, 1]
+rows = list(BUCKETS)[::-1]
+h = 0.26
+for i, e in enumerate(ENGINES):
+    ys = [r + (1 - i) * (h + 0.02) for r in range(len(rows))]
+    v = [breakdown[e][k] for k in rows]
+    ax.barh(ys, v, height=h, color=COLOR[e], label=e)
+    for y, val in zip(ys, v):
+        if val >= 0.5:
+            ax.text(val + 0.4, y, f"{val:.1f}", va="center", fontsize=7.5,
+                    color=MUTED)
+ax.set_yticks(range(len(rows)), rows)
+ax.set_xlim(0, max(max(breakdown[e].values()) for e in ENGINES) * 1.12)
+ax.set_xlabel("milliseconds per step (each engine's bars add up to its step time)")
+ax.set_title("Where the time goes")
+ax.legend(loc="lower right")
+xgrid(ax)
+
+# (c) throughput vs batch size
+ax = axs[1, 0]
+for e in ENGINES:
+    tok = [sweep[B][e]["tok_s"] for B in BENCH_BATCHES]
+    ax.plot(BENCH_BATCHES, tok, color=COLOR[e], linewidth=2, marker="o",
+            markersize=8, markeredgecolor=SURF, markeredgewidth=2, label=e)
+    ax.annotate(e, (BENCH_BATCHES[-1], tok[-1]), xytext=(8, 0),
+                textcoords="offset points", va="center", fontsize=9, color=INK2)
+ax.set_xticks(BENCH_BATCHES)
+ax.set_xlim(BENCH_BATCHES[0] - 8, BENCH_BATCHES[-1] + 30)
+ax.set_xlabel("batch size (sentences)")
+ax.set_ylabel("target tokens per second (higher is better)")
+ax.set_title("Throughput vs batch size")
+ax.grid(axis="y", color=GRID, linewidth=0.8)
+ax.legend(loc="lower right")
+
+# (d) training loss against wall-clock time
+ax = axs[1, 1]
+torch_name_ = TC if TORCH_TRAIN_MODE == "compile" else TE
+for e, run in ((HT, ht_run), (torch_name_, torch_run)):
+    secs = [t for _, _, t in run["log"]]
+    loss = [lv for _, lv, _ in run["log"]]
+    ax.plot(secs, loss, color=COLOR[e], linewidth=2, marker="o", markersize=6,
+            markeredgecolor=SURF, markeredgewidth=1.5,
+            label=f"{e}: {run['wall']:.0f} s, val loss {run['val']:.3f}")
+ax.set_xlabel("wall-clock seconds (same batches, same order)")
+ax.set_ylabel("training loss")
+ax.set_title(f"Training: {TRAIN_STEPS} steps each")
+ax.grid(axis="y", color=GRID, linewidth=0.8)
+ax.legend(loc="upper right")
+
+fig.tight_layout(rect=(0, 0, 1, 0.95))
+fig.savefig(f"{WORK}/houssem_vs_torch.png", dpi=150)
+plt.show()
+
+# %% Cell 15: report (markdown, with the chart)
 lines = [
     "# houssem_torch TrainStep vs PyTorch",
     "",
-    f"GPU: {drv.device_info(HT_GPU).name} (houssem_torch on cuda:{HT_GPU}, "
-    f"PyTorch on cuda:{TORCH_GPU}), PyTorch {torch.__version__}",
+    "![summary](houssem_vs_torch.png)",
+    "",
+    f"GPU: {gpu_name} (houssem_torch on cuda:{HT_GPU}, PyTorch on cuda:{TORCH_GPU}),"
+    f" PyTorch {torch.__version__}",
     f"Model: transformer_base, vocab {VOCAB}, {cpu_model.num_parameters():,} "
     f"parameters. Batch {BATCH} x {SRC_LEN}/{TGT_LEN}, fp16 mixed precision.",
     f"Data: opus_books {SRC_LANG}->{TGT_LANG}, {len(train_ids):,} train pairs.",
@@ -426,12 +631,25 @@ lines = [
     "## Speed (median of %d x %d steps, real batches, %.0f target tokens/batch)"
     % (BENCH_REPEATS, BENCH_STEPS, bench_tokens),
     "",
-    "| engine | ms/step | tokens/s | vs best PyTorch | setup s | memory GB |",
+    "| engine | ms/step | tokens/s | time vs houssem_torch | setup s | memory GB |",
     "|---|---:|---:|---:|---:|---:|",
 ]
-for name, r in results.items():
+for name in ENGINES:
+    r = results[name]
     lines.append(f"| {name} | {r['ms']:.1f} | {r['tok_s']:.0f} | "
-                 f"{r['speedup']:.2f}x | {r['setup_s']:.1f} | {r['mem_gb']:.2f} |")
+                 f"{r['ms'] / ht_ms:.2f}x | {r['setup_s']:.1f} | {r['mem_gb']:.2f} |")
+lines += ["", "## By batch size (ms/step)", "",
+          "| batch | " + " | ".join(ENGINES) + " | houssem_torch speedup vs "
+          "torch.compile |", "|---:|" + "---:|" * (len(ENGINES) + 1)]
+for B in BENCH_BATCHES:
+    lines.append(f"| {B} | " + " | ".join(f"{sweep[B][e]['ms']:.1f}" for e in ENGINES)
+                 + f" | {sweep[B][TC]['ms'] / sweep[B][HT]['ms']:.2f}x |")
+lines += ["", "## Where the time goes (ms/step, scaled to each engine's step time)",
+          "", "| work | " + " | ".join(ENGINES) + " |",
+          "|---|" + "---:|" * len(ENGINES)]
+for k in BUCKETS:
+    lines.append(f"| {k} | " + " | ".join(f"{breakdown[e][k]:.1f}" for e in ENGINES)
+                 + " |")
 lines += [
     "",
     f"## Training, {TRAIN_STEPS} steps each, same init and batches",
@@ -449,8 +667,8 @@ lines += [
 for (i, a, _), (_, b, _) in zip(ht_run["log"], torch_run["log"]):
     lines.append(f"| {i} | {a:.4f} | {b:.4f} |")
 lines += ["", "## Sample translations (houssem_torch weights, greedy)", ""]
-for s, r, h in translations:
-    lines += [f"- src: {s}", f"  - ref: {r}", f"  - hyp: {h}"]
+for s_, r_, h_ in translations:
+    lines += [f"- src: {s_}", f"  - ref: {r_}", f"  - hyp: {h_}"]
 report = "\n".join(lines) + "\n"
 with open(f"{WORK}/cuda_vs_torch_report.md", "w", encoding="utf-8") as f:
     f.write(report)
