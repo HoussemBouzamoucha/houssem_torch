@@ -1,17 +1,23 @@
 // houssem_torch GPU kernels for the compiled training step.
 //
 // Compiled at startup with NVRTC (driver.compile_kernel). Compile-time
-// constants, set per run from the config:
+// constants, set per run from the config (each section below is compiled
+// only when its constants are defined):
 //   USE_HALF   1: activations / working weights are fp16, 0: fp32
-//   D          d_model            (add_ln_fwd, ln_bwd; multiple of 32)
+//   D, VW      d_model (multiple of 32) and the vector width (elements per
+//              load) of the row kernels add_ln_fwd / ln_bwd
 //   LN_WARPS   warps per block in ln_bwd
-//   LK         keys per attention row (softmax_fwd / softmax_bwd)
-//   CAUSAL     1: query i only sees keys 0..i (softmax_fwd / softmax_bwd)
-//   ACT        0: relu, 1: gelu (tanh approximation)
 //   MODE       add_ln_fwd: 0 = embedding input, 1 = residual input
+//   EVW, ACT   vector width and activation (0 relu, 1 gelu-tanh) of the
+//              feed-forward kernels
+//   LK, CAUSAL keys per row and causal masking (unfused softmax)
+//   CE_V, CE_T, CE_VW  vocabulary, threads, vector width of the
+//              register-resident cross-entropy
+//   ATT, AQ, AK, AQP, AKP, DK, NW  fused attention: query / key lengths,
+//              both padded to 16, head size, warps per block
 //
 // All reductions (LayerNorm statistics, softmax, loss, norms) and every
-// gradient that is accumulated across rows run in fp32.
+// gradient accumulated across rows run in fp32.
 //
 // Dropout masks are never stored: keep/drop for element i of a dropout
 // site is a hash of (seed, i), so the backward pass regenerates exactly the
@@ -28,6 +34,7 @@ typedef float T;
 __device__ __forceinline__ float tof(T x) { return x; }
 __device__ __forceinline__ T fromf(float x) { return x; }
 #endif
+__device__ __forceinline__ float roundT(float x) { return tof(fromf(x)); }
 
 // Same value as houssem_torch.nn.attention.MASK_VALUE. Scores are masked in
 // fp32 registers, so it is safe in fp16 mode too.
@@ -94,13 +101,99 @@ __device__ float block_max(float v, float* shared32) {
     return shared32[0];
 }
 
+// Vector loads / stores of N consecutive elements (16 bytes for 8 x fp16 or
+// 4 x fp32), converted to / from fp32 registers. p must be N-aligned.
+template <int N>
+__device__ __forceinline__ void load_vec(const T* __restrict__ p, float* f) {
+#if USE_HALF
+    if constexpr (N == 8) {
+        uint4 u = *reinterpret_cast<const uint4*>(p);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float2 t = __half22float2(h[i]);
+            f[2 * i] = t.x; f[2 * i + 1] = t.y;
+        }
+    } else if constexpr (N == 4) {
+        uint2 u = *reinterpret_cast<const uint2*>(p);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float2 t = __half22float2(h[i]);
+            f[2 * i] = t.x; f[2 * i + 1] = t.y;
+        }
+    } else if constexpr (N == 2) {
+        float2 t = __half22float2(*reinterpret_cast<const __half2*>(p));
+        f[0] = t.x; f[1] = t.y;
+    } else {
+#pragma unroll
+        for (int i = 0; i < N; ++i) f[i] = tof(p[i]);
+    }
+#else
+    if constexpr (N == 4) {
+        float4 u = *reinterpret_cast<const float4*>(p);
+        f[0] = u.x; f[1] = u.y; f[2] = u.z; f[3] = u.w;
+    } else if constexpr (N == 2) {
+        float2 u = *reinterpret_cast<const float2*>(p);
+        f[0] = u.x; f[1] = u.y;
+    } else {
+#pragma unroll
+        for (int i = 0; i < N; ++i) f[i] = p[i];
+    }
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void store_vec(T* __restrict__ p, const float* f) {
+#if USE_HALF
+    if constexpr (N == 8 || N == 4 || N == 2) {
+        __half2 h[N / 2];
+#pragma unroll
+        for (int i = 0; i < N / 2; ++i) h[i] = __floats2half2_rn(f[2 * i], f[2 * i + 1]);
+        if constexpr (N == 8) *reinterpret_cast<uint4*>(p) = *reinterpret_cast<uint4*>(h);
+        else if constexpr (N == 4) *reinterpret_cast<uint2*>(p) = *reinterpret_cast<uint2*>(h);
+        else *reinterpret_cast<__half2*>(p) = h[0];
+    } else {
+#pragma unroll
+        for (int i = 0; i < N; ++i) p[i] = fromf(f[i]);
+    }
+#else
+    if constexpr (N == 4) {
+        *reinterpret_cast<float4*>(p) = make_float4(f[0], f[1], f[2], f[3]);
+    } else if constexpr (N == 2) {
+        *reinterpret_cast<float2*>(p) = make_float2(f[0], f[1]);
+    } else {
+#pragma unroll
+        for (int i = 0; i < N; ++i) p[i] = f[i];
+    }
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void load_f32(const float* __restrict__ p, float* f) {
+    if constexpr (N % 4 == 0) {
+#pragma unroll
+        for (int i = 0; i < N; i += 4) {
+            float4 u = *reinterpret_cast<const float4*>(p + i);
+            f[i] = u.x; f[i + 1] = u.y; f[i + 2] = u.z; f[i + 3] = u.w;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < N; ++i) f[i] = p[i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Residual stream: (embedding | residual + dropout) fused with LayerNorm
 // ---------------------------------------------------------------------------
-#ifdef D
-#define VPT (D / 32)
+#if defined(D) && defined(VW)
+#define VPT (D / 32)          // values per lane
+#define NV (VPT / VW)         // vector chunks per lane
+// Lane `lane` owns columns (j*32 + lane)*VW + e, j < NV, e < VW: each warp
+// load is 32 consecutive vectors (coalesced, 16 bytes per lane).
 
-// One warp per row of width D. Lane owns columns lane, lane+32, ...
+#ifdef MODE
+// One warp per row of width D.
 //   MODE 0: x_out = dropout(table[ids[row]] * emb_scale + pe[row % L])
 //   MODE 1: x_out = x_in + dropout(y + ybias)          (ybias may be null)
 // then h = LayerNorm(x_out) * w + b, saving mean and rstd per row.
@@ -124,31 +217,72 @@ extern "C" __global__ void add_ln_fwd(
     const float* prow = pe + (size_t)(row % L) * D;
 #endif
 #pragma unroll
-    for (int j = 0; j < VPT; ++j) {
-        int c = lane + 32 * j;
-        unsigned idx = (unsigned)(base + c);
+    for (int j = 0; j < NV; ++j) {
+        int c = (j * 32 + lane) * VW;
+        float a[VW];
 #if MODE == 0
-        float t = (tof(trow[c]) * emb_scale + prow[c]) * drop_mult(seed, idx, p);
+        float t[VW], pp[VW];
+        load_vec<VW>(trow + c, t);
+        load_f32<VW>(prow + c, pp);
+#pragma unroll
+        for (int e = 0; e < VW; ++e)
+            a[e] = (t[e] * emb_scale + pp[e]) * drop_mult(seed, (unsigned)(base + c + e), p);
 #else
-        float yy = tof(y[base + c]) + (ybias ? tof(ybias[c]) : 0.f);
-        float t = tof(x_in[base + c]) + yy * drop_mult(seed, idx, p);
+        float xx[VW], yy[VW], bb[VW];
+        load_vec<VW>(x_in + base + c, xx);
+        load_vec<VW>(y + base + c, yy);
+        if (ybias) load_vec<VW>(ybias + c, bb);
+        else {
+#pragma unroll
+            for (int e = 0; e < VW; ++e) bb[e] = 0.f;
+        }
+#pragma unroll
+        for (int e = 0; e < VW; ++e)
+            a[e] = xx[e] + (yy[e] + bb[e]) * drop_mult(seed, (unsigned)(base + c + e), p);
 #endif
-        T stored = fromf(t);
-        x_out[base + c] = stored;
-        v[j] = tof(stored);  // statistics of the value backward will see
-        sum += v[j];
+        store_vec<VW>(x_out + base + c, a);
+#pragma unroll
+        for (int e = 0; e < VW; ++e) {
+            v[j * VW + e] = roundT(a[e]);  // the value backward will read
+            sum += v[j * VW + e];
+        }
     }
     float mean = warp_sum(sum) * (1.f / D);
     float sq = 0.f;
 #pragma unroll
-    for (int j = 0; j < VPT; ++j) { float t = v[j] - mean; sq += t * t; }
+    for (int i = 0; i < VPT; ++i) { float t = v[i] - mean; sq += t * t; }
     float rstd = rsqrtf(warp_sum(sq) * (1.f / D) + eps);
 #pragma unroll
-    for (int j = 0; j < VPT; ++j) {
-        int c = lane + 32 * j;
-        h[base + c] = fromf((v[j] - mean) * rstd * tof(w[c]) + tof(b[c]));
+    for (int j = 0; j < NV; ++j) {
+        int c = (j * 32 + lane) * VW;
+        float ww[VW], bb[VW], o[VW];
+        load_vec<VW>(w + c, ww);
+        load_vec<VW>(b + c, bb);
+#pragma unroll
+        for (int e = 0; e < VW; ++e) o[e] = (v[j * VW + e] - mean) * rstd * ww[e] + bb[e];
+        store_vec<VW>(h + base + c, o);
     }
     if (lane == 0) { mean_out[row] = mean; rstd_out[row] = rstd; }
+}
+#endif  // MODE
+
+#ifdef LN_WARPS
+// Sum per-warp column partials over the block, one atomic per column.
+__device__ __forceinline__ void block_column_add(float (*s)[D], const float* part,
+                                                 float* __restrict__ out) {
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int j = 0; j < NV; ++j)
+#pragma unroll
+        for (int e = 0; e < VW; ++e) s[warp][(j * 32 + lane) * VW + e] = part[j * VW + e];
+    __syncthreads();
+    for (int c = threadIdx.x; c < D; c += blockDim.x) {
+        float a = 0.f;
+#pragma unroll
+        for (int k = 0; k < LN_WARPS; ++k) a += s[k][c];
+        atomicAdd(out + c, a);
+    }
+    __syncthreads();
 }
 
 // Backward of one LayerNorm site of the residual stream, fused with the
@@ -156,25 +290,25 @@ extern "C" __global__ void add_ln_fwd(
 //   g_x  = (accum ? g_x : 0) + LayerNormBackward(g_h)
 //   dw  += sum_rows g_h * x_hat,   db += sum_rows g_h       (fp32, atomics)
 //   if g_y_prev: g_y_prev = dropout_mask(seed_prev) * g_x  (grad of the
-//                previous sublayer's output, before its bias)
+//                previous sublayer's output, before its bias), and
+//                db_prev += sum_rows g_y_prev   (that bias's gradient)
 // Each warp walks rows with a grid stride, keeping its column partial sums
-// for dw/db in registers; the block combines them in shared memory and
-// issues one atomic per column.
-#ifdef LN_WARPS
+// in registers; the block combines them in shared memory and issues one
+// atomic per column.
 extern "C" __global__ void ln_bwd(
         const T* __restrict__ g_h, const T* __restrict__ x,
         const float* __restrict__ mean, const float* __restrict__ rstd,
         const T* __restrict__ w, T* __restrict__ g_x, int accum,
         float* __restrict__ dw, float* __restrict__ db,
-        T* __restrict__ g_y_prev, unsigned seed_prev, float p_prev, int rows) {
-    __shared__ float s_dw[LN_WARPS][D];
-    __shared__ float s_db[LN_WARPS][D];
+        T* __restrict__ g_y_prev, float* __restrict__ db_prev,
+        unsigned seed_prev, float p_prev, int rows) {
+    __shared__ float s_red[LN_WARPS][D];
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    float pdw[VPT], pdb[VPT], wv[VPT];
+    float pdw[VPT], pdb[VPT], pdy[VPT], wv[VPT];
 #pragma unroll
-    for (int j = 0; j < VPT; ++j) {
-        pdw[j] = 0.f; pdb[j] = 0.f; wv[j] = tof(w[lane + 32 * j]);
-    }
+    for (int j = 0; j < NV; ++j) load_vec<VW>(w + (j * 32 + lane) * VW, wv + j * VW);
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) { pdw[i] = 0.f; pdb[i] = 0.f; pdy[i] = 0.f; }
     int stride = gridDim.x * LN_WARPS;
     for (int row = blockIdx.x * LN_WARPS + warp; row < rows; row += stride) {
         size_t base = (size_t)row * D;
@@ -182,46 +316,53 @@ extern "C" __global__ void ln_bwd(
         float xh[VPT], gh[VPT];
         float s1 = 0.f, s2 = 0.f;
 #pragma unroll
-        for (int j = 0; j < VPT; ++j) {
-            int c = lane + 32 * j;
-            float g = tof(g_h[base + c]);
-            xh[j] = (tof(x[base + c]) - mu) * rs;
-            pdb[j] += g;
-            pdw[j] += g * xh[j];
-            gh[j] = g * wv[j];
-            s1 += gh[j];
-            s2 += gh[j] * xh[j];
+        for (int j = 0; j < NV; ++j) {
+            int c = (j * 32 + lane) * VW;
+            float gg[VW], xx[VW];
+            load_vec<VW>(g_h + base + c, gg);
+            load_vec<VW>(x + base + c, xx);
+#pragma unroll
+            for (int e = 0; e < VW; ++e) {
+                int i = j * VW + e;
+                xh[i] = (xx[e] - mu) * rs;
+                pdb[i] += gg[e];
+                pdw[i] += gg[e] * xh[i];
+                gh[i] = gg[e] * wv[i];
+                s1 += gh[i];
+                s2 += gh[i] * xh[i];
+            }
         }
         s1 = warp_sum(s1) * (1.f / D);
         s2 = warp_sum(s2) * (1.f / D);
 #pragma unroll
-        for (int j = 0; j < VPT; ++j) {
-            int c = lane + 32 * j;
-            float dx = rs * (gh[j] - s1 - xh[j] * s2);
-            if (accum) dx += tof(g_x[base + c]);
-            T stored = fromf(dx);
-            g_x[base + c] = stored;
-            if (g_y_prev)
-                g_y_prev[base + c] = fromf(tof(stored) *
-                                           drop_mult(seed_prev, (unsigned)(base + c), p_prev));
+        for (int j = 0; j < NV; ++j) {
+            int c = (j * 32 + lane) * VW;
+            float dx[VW], acc[VW];
+            if (accum) load_vec<VW>(g_x + base + c, acc);
+#pragma unroll
+            for (int e = 0; e < VW; ++e) {
+                int i = j * VW + e;
+                dx[e] = rs * (gh[i] - s1 - xh[i] * s2) + (accum ? acc[e] : 0.f);
+            }
+            store_vec<VW>(g_x + base + c, dx);
+            if (g_y_prev) {
+                float gy[VW];
+#pragma unroll
+                for (int e = 0; e < VW; ++e) {
+                    gy[e] = roundT(roundT(dx[e]) *
+                                   drop_mult(seed_prev, (unsigned)(base + c + e), p_prev));
+                    pdy[j * VW + e] += gy[e];
+                }
+                store_vec<VW>(g_y_prev + base + c, gy);
+            }
         }
     }
-#pragma unroll
-    for (int j = 0; j < VPT; ++j) {
-        s_dw[warp][lane + 32 * j] = pdw[j];
-        s_db[warp][lane + 32 * j] = pdb[j];
-    }
-    __syncthreads();
-    for (int c = threadIdx.x; c < D; c += blockDim.x) {
-        float a = 0.f, bsum = 0.f;
-#pragma unroll
-        for (int k = 0; k < LN_WARPS; ++k) { a += s_dw[k][c]; bsum += s_db[k][c]; }
-        atomicAdd(dw + c, a);
-        atomicAdd(db + c, bsum);
-    }
+    block_column_add(s_red, pdw, dw);
+    block_column_add(s_red, pdb, db);
+    if (db_prev) block_column_add(s_red, pdy, db_prev);
 }
 #endif  // LN_WARPS
-#endif  // D
+#endif  // D && VW
 
 // Embedding backward: dE[ids[row]] += emb_scale * dropout_mask * g_x[row].
 // Rows whose id is padding_idx (>= 0) send nothing.
@@ -243,7 +384,7 @@ extern "C" __global__ void embed_bwd(
 // ---------------------------------------------------------------------------
 // Feed-forward: bias + activation + dropout
 // ---------------------------------------------------------------------------
-#ifdef ACT
+#if defined(ACT) && defined(EVW)
 __device__ __forceinline__ float act_f(float x) {
 #if ACT == 0
     return fmaxf(x, 0.f);
@@ -265,63 +406,94 @@ __device__ __forceinline__ float act_grad(float x) {
 #endif
 }
 
-// u += bias (kept for backward);  a = dropout(act(u)).
+// Row-blocked: thread i owns columns [i*EVW, i*EVW + EVW) (blockDim.x =
+// cols / EVW), block b owns rows [b*rpb, (b+1)*rpb).
+//   u += bias (kept for backward);  a = dropout(act(u)).
 extern "C" __global__ void bias_act_fwd(
         T* __restrict__ u, const T* __restrict__ bias, T* __restrict__ a,
-        int rows, int cols, unsigned seed, float p) {
-    size_t n = (size_t)rows * cols;
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
-         i += (size_t)gridDim.x * blockDim.x) {
-        T ub = fromf(tof(u[i]) + tof(bias[i % cols]));
-        u[i] = ub;
-        a[i] = fromf(act_f(tof(ub)) * drop_mult(seed, (unsigned)i, p));
+        int rows, int cols, int rpb, unsigned seed, float p) {
+    int c = threadIdx.x * EVW;
+    if (c >= cols) return;
+    float bb[EVW];
+    load_vec<EVW>(bias + c, bb);
+    int r1 = min(rows, (blockIdx.x + 1) * rpb);
+    for (int r = blockIdx.x * rpb; r < r1; ++r) {
+        size_t i = (size_t)r * cols + c;
+        float uu[EVW], aa[EVW];
+        load_vec<EVW>(u + i, uu);
+#pragma unroll
+        for (int e = 0; e < EVW; ++e) {
+            uu[e] = roundT(uu[e] + bb[e]);
+            aa[e] = act_f(uu[e]) * drop_mult(seed, (unsigned)(i + e), p);
+        }
+        store_vec<EVW>(u + i, uu);
+        store_vec<EVW>(a + i, aa);
     }
 }
 
-// g (grad of a) -> grad of u, in place: g * dropout_mask * act'(u).
+// g (grad of a) -> grad of u, in place: g * dropout_mask * act'(u), and
+// dbias += column sums of the result (the bias gradient). Same layout as
+// bias_act_fwd.
 extern "C" __global__ void act_bwd(
-        T* __restrict__ g, const T* __restrict__ u, int rows, int cols,
-        unsigned seed, float p) {
-    size_t n = (size_t)rows * cols;
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
-         i += (size_t)gridDim.x * blockDim.x) {
-        g[i] = fromf(tof(g[i]) * drop_mult(seed, (unsigned)i, p) * act_grad(tof(u[i])));
+        T* __restrict__ g, const T* __restrict__ u, float* __restrict__ dbias,
+        int rows, int cols, int rpb, unsigned seed, float p) {
+    int c = threadIdx.x * EVW;
+    if (c >= cols) return;
+    float part[EVW];
+#pragma unroll
+    for (int e = 0; e < EVW; ++e) part[e] = 0.f;
+    int r1 = min(rows, (blockIdx.x + 1) * rpb);
+    for (int r = blockIdx.x * rpb; r < r1; ++r) {
+        size_t i = (size_t)r * cols + c;
+        float gg[EVW], uu[EVW];
+        load_vec<EVW>(g + i, gg);
+        load_vec<EVW>(u + i, uu);
+#pragma unroll
+        for (int e = 0; e < EVW; ++e) {
+            gg[e] = roundT(gg[e] * drop_mult(seed, (unsigned)(i + e), p) * act_grad(uu[e]));
+            part[e] += gg[e];
+        }
+        store_vec<EVW>(g + i, gg);
+    }
+    if (dbias) {
+#pragma unroll
+        for (int e = 0; e < EVW; ++e) atomicAdd(dbias + c + e, part[e]);
     }
 }
-#endif  // ACT
+#endif  // ACT && EVW
 
 // ---------------------------------------------------------------------------
-// Attention: head layout changes, masked softmax + dropout
+// Attention, unfused path (fp32, or shapes the fused kernels don't cover)
 // ---------------------------------------------------------------------------
 
 // src (B*L, NP*H*DK) [+ bias] -> dst (NP, B, H, L, DK).  NP = 3 for Q|K|V.
 extern "C" __global__ void split_heads(
         const T* __restrict__ src, const T* __restrict__ bias,
-        T* __restrict__ dst, int B, int L, int H, int DK, int NP) {
-    int dm = H * DK, width = NP * dm;
+        T* __restrict__ dst, int B, int L, int H, int DKr, int NP) {
+    int dm = H * DKr, width = NP * dm;
     size_t n = (size_t)B * L * width;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
          i += (size_t)gridDim.x * blockDim.x) {
         int row = (int)(i / width), c = (int)(i % width);
-        int part = c / dm, cc = c % dm, head = cc / DK, k = cc % DK;
+        int part = c / dm, cc = c % dm, head = cc / DKr, k = cc % DKr;
         int b = row / L, l = row % L;
         float v = tof(src[i]) + (bias ? tof(bias[c]) : 0.f);
-        dst[((((size_t)part * B + b) * H + head) * L + l) * DK + k] = fromf(v);
+        dst[((((size_t)part * B + b) * H + head) * L + l) * DKr + k] = fromf(v);
     }
 }
 
 // Inverse of split_heads (no bias): src (NP, B, H, L, DK) -> dst (B*L, NP*H*DK).
 extern "C" __global__ void merge_heads(
         const T* __restrict__ src, T* __restrict__ dst,
-        int B, int L, int H, int DK, int NP) {
-    int dm = H * DK, width = NP * dm;
+        int B, int L, int H, int DKr, int NP) {
+    int dm = H * DKr, width = NP * dm;
     size_t n = (size_t)B * L * width;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
          i += (size_t)gridDim.x * blockDim.x) {
         int row = (int)(i / width), c = (int)(i % width);
-        int part = c / dm, cc = c % dm, head = cc / DK, k = cc % DK;
+        int part = c / dm, cc = c % dm, head = cc / DKr, k = cc % DKr;
         int b = row / L, l = row % L;
-        dst[i] = src[((((size_t)part * B + b) * H + head) * L + l) * DK + k];
+        dst[i] = src[((((size_t)part * B + b) * H + head) * L + l) * DKr + k];
     }
 }
 
@@ -340,8 +512,6 @@ __device__ __forceinline__ bool is_masked(const int* kid, int b, int q, int k,
 // One warp per score row. S: (B*H*LQ, LK) scaled scores.
 //   P  = softmax(S with masked keys set to MASK_VALUE)   (saved)
 //   Pd = dropout(P)                                       (multiplies V)
-// kid: (B, LK) key token ids; a key is masked if it is padding (or in the
-// future, when CAUSAL).
 extern "C" __global__ void softmax_fwd(
         const T* __restrict__ S, T* __restrict__ P, T* __restrict__ Pd,
         const int* __restrict__ kid, int rows, int LQ, int H, int pad_id,
@@ -418,15 +588,430 @@ extern "C" __global__ void softmax_bwd(
 #endif  // LK
 
 // ---------------------------------------------------------------------------
+// Attention, fused (fp16, tensor cores): one block per (batch, head)
+// ---------------------------------------------------------------------------
+// Q/K/V are read straight from the projection outputs (row stride qs/ks/vs,
+// head h at column h*DK, bias added on load), the context is written in
+// merged (B*AQ, H*DK) layout. Nothing of size AQ x AK touches global memory:
+// forward keeps scores and probabilities in registers and saves the row max
+// and log(sum of exp) per row (two floats: as one log-sum-exp, a fully
+// masked row's -1e9 + log(AK) would round to -1e9 in fp32); backward
+// recomputes the probabilities from them.
+//
+// Matrix products use mma.sync.m16n8k8 (Turing fp16 tensor cores, fp32
+// accumulation). Per thread (lane = 4*g + t): A fragment (16x8, row-major)
+// = rows g, g+8 x cols 2t, 2t+1; B fragment (8x8) = rows 2t, 2t+1 x col g;
+// C fragment (16x8) = rows g, g+8 x cols 2t, 2t+1. A C fragment of one
+// product is directly the A fragment of the next (FlashAttention-2 style).
+#ifdef ATT
+#define LDS (DK + 8)      // shared row stride (halves) for Q, K, V, dO
+#define LDP (AKP + 8)     // shared row stride (halves) for dS, Pd: [query][key]
+#define NT_K (AKP / 8)    // 8-wide key tiles
+#define NT_D (DK / 8)     // 8-wide head-dim tiles
+
+__device__ __forceinline__ unsigned pack2(__half a, __half b) {
+    return (unsigned)__half_as_ushort(a) | ((unsigned)__half_as_ushort(b) << 16);
+}
+
+__device__ __forceinline__ unsigned pack2f(float a, float b) {
+    return pack2(__float2half(a), __float2half(b));
+}
+
+__device__ __forceinline__ unsigned ld2(const __half* p) {  // 2 consecutive halves
+    return *reinterpret_cast<const unsigned*>(p);
+}
+
+__device__ __forceinline__ void mma16816(float* c, unsigned a0, unsigned a1,
+                                         unsigned b0) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+}
+
+// Load one head's rows [0, L) into shared dst[LP][LDS] (rows >= L zeroed),
+// adding the bias if given.
+__device__ __forceinline__ void load_head(__half* dst, const __half* src,
+                                          int stride, const __half* bias,
+                                          int b, int h, int L, int LP) {
+    for (int i = threadIdx.x; i < LP * (DK / 8); i += blockDim.x) {
+        int r = i / (DK / 8), c = (i % (DK / 8)) * 8;
+        float f[8];
+        if (r < L) {
+            load_vec<8>(src + (size_t)(b * L + r) * stride + h * DK + c, f);
+            if (bias) {
+                float bb[8];
+                load_vec<8>(bias + h * DK + c, bb);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) f[e] += bb[e];
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) f[e] = 0.f;
+        }
+        store_vec<8>(dst + r * LDS + c, f);
+    }
+}
+
+// key_state: 0 = visible, 1 = padding (MASK_VALUE), 2 = beyond AK (-inf)
+__device__ __forceinline__ void load_key_state(int* ks, const int* kid, int b,
+                                               int pad_id) {
+    for (int j = threadIdx.x; j < AKP; j += blockDim.x)
+        ks[j] = j >= AK ? 2 : (kid[(size_t)b * AK + j] == pad_id ? 1 : 0);
+}
+
+// Scaled, masked scores of a 16-row query tile against all keys:
+// s[j][e] for key tile j; element e: row m0+g (+8 if e >= 2), key 8j+2t+(e&1).
+__device__ __forceinline__ void tile_scores(float (*s)[4], const __half* sQ,
+                                            const __half* sK, const int* kst,
+                                            int m0, int g, int t, float alpha) {
+#pragma unroll
+    for (int j = 0; j < NT_K; ++j) {
+        s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+#pragma unroll
+        for (int k0 = 0; k0 < DK; k0 += 8) {
+            unsigned a0 = ld2(sQ + (m0 + g) * LDS + k0 + 2 * t);
+            unsigned a1 = ld2(sQ + (m0 + g + 8) * LDS + k0 + 2 * t);
+            unsigned b0 = ld2(sK + (8 * j + g) * LDS + k0 + 2 * t);
+            mma16816(s[j], a0, a1, b0);
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            int col = 8 * j + 2 * t + (e & 1);
+            int row = m0 + g + (e >= 2 ? 8 : 0);
+            int st = kst[col];
+            bool masked = st == 1;
+#if CAUSAL
+            masked = masked || col > row;
+#endif
+            s[j][e] = st == 2 ? -INFINITY : (masked ? MASK_VALUE : s[j][e] * alpha);
+        }
+    }
+}
+
+extern "C" __global__ void attn_fwd(
+        const __half* __restrict__ q, int qs, const __half* __restrict__ qb,
+        const __half* __restrict__ k, int ks, const __half* __restrict__ kb,
+        const __half* __restrict__ v, int vs, const __half* __restrict__ vb,
+        const int* __restrict__ kid, __half* __restrict__ out, int os,
+        float* __restrict__ lse, int H, int pad_id, unsigned seed, float p,
+        float alpha) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sQ = reinterpret_cast<__half*>(smem);
+    __half* sK = sQ + AQP * LDS;
+    __half* sV = sK + AKP * LDS;
+    __shared__ int kst[AKP];
+    int bh = blockIdx.x, b = bh / H, h = bh % H;
+    load_head(sQ, q, qs, qb, b, h, AQ, AQP);
+    load_head(sK, k, ks, kb, b, h, AK, AKP);
+    load_head(sV, v, vs, vb, b, h, AK, AKP);
+    load_key_state(kst, kid, b, pad_id);
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    for (int m0 = warp * 16; m0 < AQP; m0 += NW * 16) {
+        float s[NT_K][4];
+        tile_scores(s, sQ, sK, kst, m0, g, t, alpha);
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < NT_K; ++j) {
+            mx0 = fmaxf(mx0, fmaxf(s[j][0], s[j][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[j][2], s[j][3]));
+        }
+        for (int o = 1; o <= 2; o <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, o));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, o));
+        }
+        float sum0 = 0.f, sum1 = 0.f;
+#pragma unroll
+        for (int j = 0; j < NT_K; ++j) {
+            s[j][0] = __expf(s[j][0] - mx0); s[j][1] = __expf(s[j][1] - mx0);
+            s[j][2] = __expf(s[j][2] - mx1); s[j][3] = __expf(s[j][3] - mx1);
+            sum0 += s[j][0] + s[j][1];
+            sum1 += s[j][2] + s[j][3];
+        }
+        for (int o = 1; o <= 2; o <<= 1) {
+            sum0 += __shfl_xor_sync(0xffffffffu, sum0, o);
+            sum1 += __shfl_xor_sync(0xffffffffu, sum1, o);
+        }
+        float inv0 = 1.f / sum0, inv1 = 1.f / sum1;
+        int r0 = m0 + g, r1 = m0 + g + 8;
+        // O = dropout(P) @ V; the score tile is the A operand directly.
+        float o[NT_D][4];
+#pragma unroll
+        for (int nd = 0; nd < NT_D; ++nd) o[nd][0] = o[nd][1] = o[nd][2] = o[nd][3] = 0.f;
+#pragma unroll
+        for (int j = 0; j < NT_K; ++j) {
+            int c0 = 8 * j + 2 * t;
+            size_t i0 = ((size_t)bh * AQ + r0) * AK + c0;
+            size_t i1 = ((size_t)bh * AQ + r1) * AK + c0;
+            bool v0 = r0 < AQ, v1 = r1 < AQ;
+            float p00 = s[j][0] * inv0 * (v0 && c0 < AK ? drop_mult(seed, (unsigned)i0, p) : 0.f);
+            float p01 = s[j][1] * inv0 * (v0 && c0 + 1 < AK ? drop_mult(seed, (unsigned)(i0 + 1), p) : 0.f);
+            float p10 = s[j][2] * inv1 * (v1 && c0 < AK ? drop_mult(seed, (unsigned)i1, p) : 0.f);
+            float p11 = s[j][3] * inv1 * (v1 && c0 + 1 < AK ? drop_mult(seed, (unsigned)(i1 + 1), p) : 0.f);
+            unsigned a0 = pack2f(p00, p01), a1 = pack2f(p10, p11);
+#pragma unroll
+            for (int nd = 0; nd < NT_D; ++nd) {
+                unsigned b0 = pack2(sV[(8 * j + 2 * t) * LDS + 8 * nd + g],
+                                    sV[(8 * j + 2 * t + 1) * LDS + 8 * nd + g]);
+                mma16816(o[nd], a0, a1, b0);
+            }
+        }
+#pragma unroll
+        for (int nd = 0; nd < NT_D; ++nd) {
+            int c = h * DK + 8 * nd + 2 * t;
+            if (r0 < AQ)
+                *reinterpret_cast<__half2*>(out + (size_t)(b * AQ + r0) * os + c) =
+                    __floats2half2_rn(o[nd][0], o[nd][1]);
+            if (r1 < AQ)
+                *reinterpret_cast<__half2*>(out + (size_t)(b * AQ + r1) * os + c) =
+                    __floats2half2_rn(o[nd][2], o[nd][3]);
+        }
+        if (t == 0) {
+            if (r0 < AQ) {
+                lse[2 * ((size_t)bh * AQ + r0)] = mx0;
+                lse[2 * ((size_t)bh * AQ + r0) + 1] = __logf(sum0);
+            }
+            if (r1 < AQ) {
+                lse[2 * ((size_t)bh * AQ + r1)] = mx1;
+                lse[2 * ((size_t)bh * AQ + r1) + 1] = __logf(sum1);
+            }
+        }
+    }
+}
+
+// Column sums of a C-fragment accumulator over the tile's valid rows, added
+// to shared s_col[DK] (bias gradients).
+__device__ __forceinline__ void add_col_sums(float* s_col, const float (*acc)[4],
+                                             bool v0, bool v1, int t) {
+#pragma unroll
+    for (int nd = 0; nd < NT_D; ++nd) {
+        float c0 = (v0 ? acc[nd][0] : 0.f) + (v1 ? acc[nd][2] : 0.f);
+        float c1 = (v0 ? acc[nd][1] : 0.f) + (v1 ? acc[nd][3] : 0.f);
+        for (int o = 4; o <= 16; o <<= 1) {
+            c0 += __shfl_xor_sync(0xffffffffu, c0, o);
+            c1 += __shfl_xor_sync(0xffffffffu, c1, o);
+        }
+        if ((threadIdx.x & 31) < 4) {
+            atomicAdd(s_col + 8 * nd + 2 * t, c0);
+            atomicAdd(s_col + 8 * nd + 2 * t + 1, c1);
+        }
+    }
+}
+
+__device__ __forceinline__ void store_rows(__half* dst, int stride, int b, int L,
+                                           int h, const float (*acc)[4], int r0,
+                                           int r1, int t, float scale) {
+#pragma unroll
+    for (int nd = 0; nd < NT_D; ++nd) {
+        int c = h * DK + 8 * nd + 2 * t;
+        if (r0 < L)
+            *reinterpret_cast<__half2*>(dst + (size_t)(b * L + r0) * stride + c) =
+                __floats2half2_rn(acc[nd][0] * scale, acc[nd][1] * scale);
+        if (r1 < L)
+            *reinterpret_cast<__half2*>(dst + (size_t)(b * L + r1) * stride + c) =
+                __floats2half2_rn(acc[nd][2] * scale, acc[nd][3] * scale);
+    }
+}
+
+// Backward. o: the forward's context (merged layout), dout: its gradient.
+// Writes dq / dk / dv (merged layouts, every valid row) and adds the bias
+// gradients (column sums) to dqb / dkb / dvb if given.
+//   phase 1, warps own query tiles: recompute P from lse; dPd = dO V^T;
+//            dS = P (mask*dPd - D) with D = rowsum(dO * O); dQ = a*dS K;
+//            dS and dropout(P) go to shared memory.
+//   phase 2, warps own key tiles: dV = Pd^T dO, dK = a*dS^T Q.
+extern "C" __global__ void attn_bwd(
+        const __half* __restrict__ q, int qs, const __half* __restrict__ qb,
+        const __half* __restrict__ k, int ks, const __half* __restrict__ kb,
+        const __half* __restrict__ v, int vs, const __half* __restrict__ vb,
+        const int* __restrict__ kid,
+        const __half* __restrict__ o, int os, const __half* __restrict__ dout,
+        int dos, const float* __restrict__ lse,
+        __half* __restrict__ dq, int dqs, __half* __restrict__ dk, int dks,
+        __half* __restrict__ dv, int dvs,
+        float* __restrict__ dqb, float* __restrict__ dkb, float* __restrict__ dvb,
+        int H, int pad_id, unsigned seed, float p, float alpha) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* sQ = reinterpret_cast<__half*>(smem);
+    __half* sK = sQ + AQP * LDS;
+    __half* sV = sK + AKP * LDS;
+    __half* sdO = sV + AKP * LDS;
+    __half* sdS = sdO + AQP * LDS;
+    __half* sPd = sdS + AQP * LDP;
+    __shared__ int kst[AKP];
+    __shared__ float sD[AQP];
+    __shared__ float s_bias[3][DK];
+    int bh = blockIdx.x, b = bh / H, h = bh % H;
+    load_head(sQ, q, qs, qb, b, h, AQ, AQP);
+    load_head(sK, k, ks, kb, b, h, AK, AKP);
+    load_head(sV, v, vs, vb, b, h, AK, AKP);
+    load_head(sdO, dout, dos, nullptr, b, h, AQ, AQP);
+    load_key_state(kst, kid, b, pad_id);
+    for (int i = threadIdx.x; i < 3 * DK; i += blockDim.x) (&s_bias[0][0])[i] = 0.f;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    // D[r] = dO[r] * O[r]
+    for (int r = warp; r < AQP; r += NW) {
+        float acc = 0.f;
+        if (r < AQ)
+            for (int c = lane; c < DK; c += 32)
+                acc += __half2float(o[(size_t)(b * AQ + r) * os + h * DK + c]) *
+                       __half2float(dout[(size_t)(b * AQ + r) * dos + h * DK + c]);
+        acc = warp_sum(acc);
+        if (lane == 0) sD[r] = acc;
+    }
+    __syncthreads();
+
+    // ---- phase 1: query tiles
+    for (int m0 = warp * 16; m0 < AQP; m0 += NW * 16) {
+        int r0 = m0 + g, r1 = m0 + g + 8;
+        bool v0 = r0 < AQ, v1 = r1 < AQ;
+        float m0r = v0 ? lse[2 * ((size_t)bh * AQ + r0)] : 0.f;
+        float m1r = v1 ? lse[2 * ((size_t)bh * AQ + r1)] : 0.f;
+        float l0 = v0 ? lse[2 * ((size_t)bh * AQ + r0) + 1] : 0.f;
+        float l1 = v1 ? lse[2 * ((size_t)bh * AQ + r1) + 1] : 0.f;
+        float D0 = sD[r0], D1 = sD[r1];
+        float s[NT_K][4];
+        tile_scores(s, sQ, sK, kst, m0, g, t, alpha);
+        float dq_acc[NT_D][4];
+#pragma unroll
+        for (int nd = 0; nd < NT_D; ++nd)
+            dq_acc[nd][0] = dq_acc[nd][1] = dq_acc[nd][2] = dq_acc[nd][3] = 0.f;
+#pragma unroll
+        for (int j = 0; j < NT_K; ++j) {
+            float dpd[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int k0 = 0; k0 < DK; k0 += 8) {
+                unsigned a0 = ld2(sdO + r0 * LDS + k0 + 2 * t);
+                unsigned a1 = ld2(sdO + r1 * LDS + k0 + 2 * t);
+                unsigned b0 = ld2(sV + (8 * j + g) * LDS + k0 + 2 * t);
+                mma16816(dpd, a0, a1, b0);
+            }
+            float ds[4], pd[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                int col = 8 * j + 2 * t + (e & 1);
+                int row = e >= 2 ? r1 : r0;
+                bool valid = (e >= 2 ? v1 : v0) && col < AK;
+                float pr = valid ? __expf((s[j][e] - (e >= 2 ? m1r : m0r)) -
+                                          (e >= 2 ? l1 : l0)) : 0.f;
+                float m = valid ? drop_mult(seed, (unsigned)(((size_t)bh * AQ + row) * AK + col), p)
+                                : 0.f;
+                bool masked = kst[col] == 1;
+#if CAUSAL
+                masked = masked || col > row;
+#endif
+                ds[e] = (valid && !masked) ? pr * (m * dpd[e] - (e >= 2 ? D1 : D0)) : 0.f;
+                pd[e] = pr * m;
+            }
+            int c0 = 8 * j + 2 * t;
+            *reinterpret_cast<__half2*>(sdS + r0 * LDP + c0) = __floats2half2_rn(ds[0], ds[1]);
+            *reinterpret_cast<__half2*>(sdS + r1 * LDP + c0) = __floats2half2_rn(ds[2], ds[3]);
+            *reinterpret_cast<__half2*>(sPd + r0 * LDP + c0) = __floats2half2_rn(pd[0], pd[1]);
+            *reinterpret_cast<__half2*>(sPd + r1 * LDP + c0) = __floats2half2_rn(pd[2], pd[3]);
+            // dQ += dS(:, key tile j) @ K(key tile j, :)
+            unsigned a0 = pack2f(ds[0], ds[1]), a1 = pack2f(ds[2], ds[3]);
+#pragma unroll
+            for (int nd = 0; nd < NT_D; ++nd) {
+                unsigned b0 = pack2(sK[(8 * j + 2 * t) * LDS + 8 * nd + g],
+                                    sK[(8 * j + 2 * t + 1) * LDS + 8 * nd + g]);
+                mma16816(dq_acc[nd], a0, a1, b0);
+            }
+        }
+        store_rows(dq, dqs, b, AQ, h, dq_acc, r0, r1, t, alpha);
+        if (dqb) {
+#pragma unroll
+            for (int nd = 0; nd < NT_D; ++nd)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) dq_acc[nd][e] *= alpha;
+            add_col_sums(s_bias[0], dq_acc, v0, v1, t);
+        }
+    }
+    __syncthreads();
+
+    // ---- phase 2: key tiles
+    for (int m0 = warp * 16; m0 < AKP; m0 += NW * 16) {
+        int r0 = m0 + g, r1 = m0 + g + 8;        // key rows
+        float dv_acc[NT_D][4], dk_acc[NT_D][4];
+#pragma unroll
+        for (int nd = 0; nd < NT_D; ++nd) {
+            dv_acc[nd][0] = dv_acc[nd][1] = dv_acc[nd][2] = dv_acc[nd][3] = 0.f;
+            dk_acc[nd][0] = dk_acc[nd][1] = dk_acc[nd][2] = dk_acc[nd][3] = 0.f;
+        }
+        for (int k0 = 0; k0 < AQP; k0 += 8) {    // over queries
+            unsigned ap0 = pack2(sPd[(k0 + 2 * t) * LDP + r0], sPd[(k0 + 2 * t + 1) * LDP + r0]);
+            unsigned ap1 = pack2(sPd[(k0 + 2 * t) * LDP + r1], sPd[(k0 + 2 * t + 1) * LDP + r1]);
+            unsigned as0 = pack2(sdS[(k0 + 2 * t) * LDP + r0], sdS[(k0 + 2 * t + 1) * LDP + r0]);
+            unsigned as1 = pack2(sdS[(k0 + 2 * t) * LDP + r1], sdS[(k0 + 2 * t + 1) * LDP + r1]);
+#pragma unroll
+            for (int nd = 0; nd < NT_D; ++nd) {
+                unsigned bo = pack2(sdO[(k0 + 2 * t) * LDS + 8 * nd + g],
+                                    sdO[(k0 + 2 * t + 1) * LDS + 8 * nd + g]);
+                unsigned bq = pack2(sQ[(k0 + 2 * t) * LDS + 8 * nd + g],
+                                    sQ[(k0 + 2 * t + 1) * LDS + 8 * nd + g]);
+                mma16816(dv_acc[nd], ap0, ap1, bo);
+                mma16816(dk_acc[nd], as0, as1, bq);
+            }
+        }
+        store_rows(dv, dvs, b, AK, h, dv_acc, r0, r1, t, 1.f);
+        store_rows(dk, dks, b, AK, h, dk_acc, r0, r1, t, alpha);
+        bool v0 = r0 < AK, v1 = r1 < AK;
+        if (dvb) add_col_sums(s_bias[2], dv_acc, v0, v1, t);
+        if (dkb) {
+#pragma unroll
+            for (int nd = 0; nd < NT_D; ++nd)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) dk_acc[nd][e] *= alpha;
+            add_col_sums(s_bias[1], dk_acc, v0, v1, t);
+        }
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < DK; c += blockDim.x) {
+        if (dqb) atomicAdd(dqb + h * DK + c, s_bias[0][c]);
+        if (dkb) atomicAdd(dkb + h * DK + c, s_bias[1][c]);
+        if (dvb) atomicAdd(dvb + h * DK + c, s_bias[2][c]);
+    }
+}
+#endif  // ATT
+
+// ---------------------------------------------------------------------------
 // Loss: label-smoothed cross-entropy, forward and backward in one pass
 // ---------------------------------------------------------------------------
-
 // One block per row of logits (N, V). Overwrites the row with
 //   dlogits = (softmax - q) * loss_scale / count      (0 on ignored rows)
 // and adds loss_row / count to *loss_sum. q is the smoothed target:
 //   uniform:    eps/V everywhere, + (1-eps) at the target
 //   non_target: (1-eps) at the target, 0 at `pad`, eps/K on the K others
 // pad / ignore < 0 mean "none". scalars[0] holds the loss scale.
+
+__device__ __forceinline__ void ce_row_terms(float lse, float sx, float xt, float xpad,
+                                             int V, int t, float eps, int non_target,
+                                             int pad, float* w, float* loss,
+                                             bool* pad_other) {
+    *pad_other = pad >= 0 && t != pad;
+    if (non_target) {
+        float k = fmaxf((float)(V - 1 - (*pad_other ? 1 : 0)), 1.f);
+        float others = sx - xt - (*pad_other ? xpad : 0.f);
+        *w = eps / k;
+        *loss = (1.f - eps) * (lse - xt) + eps * (lse - others / k);
+    } else {
+        *w = eps / V;
+        *loss = (1.f - eps) * (lse - xt) + eps * (lse - sx / V);
+    }
+}
+
+__device__ __forceinline__ float ce_target(int c, int t, float w, float eps,
+                                           int non_target, bool pad_other, int pad) {
+    if (non_target) {
+        if (c == t) return 1.f - eps;
+        if (pad_other && c == pad) return 0.f;
+        return w;
+    }
+    return c == t ? w + 1.f - eps : w;
+}
+
+// General version: reads the row from global memory three times.
 extern "C" __global__ void cross_entropy(
         T* __restrict__ logits, const int* __restrict__ targets, int V,
         float eps, int non_target, int pad, int ignore,
@@ -456,31 +1041,83 @@ extern "C" __global__ void cross_entropy(
     }
     __syncthreads();
     float lse = mx + __logf(se);
-    float xt = s_xt;
-    bool pad_other = pad >= 0 && t != pad;  // pad is a non-target class here
     float w, loss;
-    if (non_target) {
-        float k = fmaxf((float)(V - 1 - (pad_other ? 1 : 0)), 1.f);
-        float others = sx - xt - (pad_other ? s_xpad : 0.f);
-        w = eps / k;
-        loss = (1.f - eps) * (lse - xt) + eps * (lse - others / k);
-    } else {
-        w = eps / V;
-        loss = (1.f - eps) * (lse - xt) + eps * (lse - sx / V);
-    }
+    bool pad_other;
+    ce_row_terms(lse, sx, s_xt, s_xpad, V, t, eps, non_target, pad, &w, &loss, &pad_other);
     float coef = valid ? scalars[0] * inv_count : 0.f;
-    for (int c = threadIdx.x; c < V; c += blockDim.x) {
-        float q = w;
-        if (non_target) {
-            if (c == t) q = 1.f - eps;
-            else if (pad_other && c == pad) q = 0.f;
-        } else if (c == t) {
-            q += 1.f - eps;
+    for (int c = threadIdx.x; c < V; c += blockDim.x)
+        x[c] = fromf((__expf(tof(x[c]) - lse) -
+                      ce_target(c, t, w, eps, non_target, pad_other, pad)) * coef);
+    if (threadIdx.x == 0 && valid) atomicAdd(loss_sum, loss * inv_count);
+}
+
+#if defined(CE_V) && defined(CE_T) && defined(CE_VW)
+#define CE_NPT ((CE_V + CE_T * CE_VW - 1) / (CE_T * CE_VW))
+// Register-resident version: the row is read once into registers and the
+// gradient written once (blockDim.x == CE_T).
+extern "C" __global__ void cross_entropy_reg(
+        T* __restrict__ logits, const int* __restrict__ targets,
+        float eps, int non_target, int pad, int ignore,
+        const float* __restrict__ scalars, float inv_count,
+        float* __restrict__ loss_sum) {
+    __shared__ float red[32];
+    __shared__ float s_xt, s_xpad;
+    int row = blockIdx.x;
+    T* x = logits + (size_t)row * CE_V;
+    int t = targets[row];
+    bool valid = ignore < 0 || t != ignore;
+    if (!valid) t = 0;
+    float v[CE_NPT * CE_VW];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < CE_NPT; ++j) {
+        int c = (j * CE_T + threadIdx.x) * CE_VW;
+        if (c < CE_V) {
+            load_vec<CE_VW>(x + c, v + j * CE_VW);
+#pragma unroll
+            for (int e = 0; e < CE_VW; ++e) mx = fmaxf(mx, v[j * CE_VW + e]);
         }
-        x[c] = fromf((__expf(tof(x[c]) - lse) - q) * coef);
+    }
+    if (threadIdx.x == 0) {
+        s_xt = tof(x[t]);
+        s_xpad = pad >= 0 ? tof(x[pad]) : 0.f;
+    }
+    mx = block_max(mx, red);
+    float se = 0.f, sx = 0.f;
+#pragma unroll
+    for (int j = 0; j < CE_NPT; ++j) {
+        int c = (j * CE_T + threadIdx.x) * CE_VW;
+        if (c < CE_V) {
+#pragma unroll
+            for (int e = 0; e < CE_VW; ++e) {
+                se += __expf(v[j * CE_VW + e] - mx);
+                sx += v[j * CE_VW + e];
+            }
+        }
+    }
+    se = block_sum(se, red);
+    sx = block_sum(sx, red);
+    float lse = mx + __logf(se);
+    float w, loss;
+    bool pad_other;
+    ce_row_terms(lse, sx, s_xt, s_xpad, CE_V, t, eps, non_target, pad, &w, &loss,
+                 &pad_other);
+    float coef = valid ? scalars[0] * inv_count : 0.f;
+#pragma unroll
+    for (int j = 0; j < CE_NPT; ++j) {
+        int c = (j * CE_T + threadIdx.x) * CE_VW;
+        if (c < CE_V) {
+            float gr[CE_VW];
+#pragma unroll
+            for (int e = 0; e < CE_VW; ++e)
+                gr[e] = (__expf(v[j * CE_VW + e] - lse) -
+                         ce_target(c + e, t, w, eps, non_target, pad_other, pad)) * coef;
+            store_vec<CE_VW>(x + c, gr);
+        }
     }
     if (threadIdx.x == 0 && valid) atomicAdd(loss_sum, loss * inv_count);
 }
+#endif  // CE_V
 
 // ---------------------------------------------------------------------------
 // Optimizer: gradient norm, loss scaling, AdamW over one flat buffer
@@ -495,14 +1132,15 @@ extern "C" __global__ void reset_scalars(float* s) {
     s[2] = 0.f;
 }
 
-extern "C" __global__ void sum_squares(const float* __restrict__ g, int n,
+// n4 = number of float4 groups (the flat buffers are padded to 64).
+extern "C" __global__ void sum_squares(const float4* __restrict__ g, int n4,
                                        float* __restrict__ out) {
     __shared__ float red[32];
     float acc = 0.f;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += gridDim.x * blockDim.x) {
-        float v = g[i];
-        acc += v * v;
+        float4 v = g[i];
+        acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
     acc = block_sum(acc, red);
     if (threadIdx.x == 0) atomicAdd(out, acc);
@@ -542,25 +1180,36 @@ extern "C" __global__ void step_prepare(float* s, float b1, float b2,
 }
 
 // AdamW (decoupled=1) or Adam with L2 penalty (decoupled=0) over all
-// parameters at once. Writes the fp32 master weights and the working copy.
+// parameters at once, four per thread per iteration. Writes the fp32 master
+// weights and the working copy (which is the master itself in fp32 mode).
 extern "C" __global__ void adamw(
         float* p, const float* __restrict__ g, float* __restrict__ m,
-        float* __restrict__ v, T* p_work, int n, const float* __restrict__ s,
+        float* __restrict__ v, T* p_work, int n4, const float* __restrict__ s,
         float lr, float b1, float b2, float eps, float wd, int decoupled) {
     if (s[4] != 0.f) return;  // overflow: skip this step
     float coef = s[3], bc1 = s[6], bc2 = s[7];
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4;
          i += gridDim.x * blockDim.x) {
-        float pi = p[i];
-        float gi = g[i] * coef;
-        if (!decoupled) gi += wd * pi;
-        float mi = b1 * m[i] + (1.f - b1) * gi;
-        float vi = b2 * v[i] + (1.f - b2) * gi * gi;
-        m[i] = mi;
-        v[i] = vi;
-        if (decoupled) pi *= 1.f - lr * wd;
-        pi -= lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
-        p[i] = pi;
-        p_work[i] = fromf(pi);
+        float4 P = reinterpret_cast<float4*>(p)[i];
+        float4 G = reinterpret_cast<const float4*>(g)[i];
+        float4 M = reinterpret_cast<float4*>(m)[i];
+        float4 W = reinterpret_cast<float4*>(v)[i];
+        float pp[4] = {P.x, P.y, P.z, P.w}, gg[4] = {G.x, G.y, G.z, G.w};
+        float mm[4] = {M.x, M.y, M.z, M.w}, vv[4] = {W.x, W.y, W.z, W.w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float gi = gg[e] * coef;
+            if (!decoupled) gi += wd * pp[e];
+            mm[e] = b1 * mm[e] + (1.f - b1) * gi;
+            vv[e] = b2 * vv[e] + (1.f - b2) * gi * gi;
+            if (decoupled) pp[e] *= 1.f - lr * wd;
+            pp[e] -= lr * (mm[e] / bc1) / (sqrtf(vv[e] / bc2) + eps);
+        }
+        reinterpret_cast<float4*>(m)[i] = make_float4(mm[0], mm[1], mm[2], mm[3]);
+        reinterpret_cast<float4*>(v)[i] = make_float4(vv[0], vv[1], vv[2], vv[3]);
+        reinterpret_cast<float4*>(p)[i] = make_float4(pp[0], pp[1], pp[2], pp[3]);
+#if USE_HALF
+        store_vec<4>(p_work + 4 * (size_t)i, pp);
+#endif
     }
 }

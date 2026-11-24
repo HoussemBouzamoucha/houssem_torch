@@ -400,6 +400,11 @@ class Kernel:
         with _Timed(self.name):
             self._fn(grid, block, args, shared_mem=shared_mem)
 
+    def set_max_dynamic_shared(self, nbytes: int) -> None:
+        """Allow launches with up to `nbytes` of dynamic shared memory
+        (above 48 KB needs this opt-in; sm_75 allows up to 64 KB)."""
+        self._fn.max_dynamic_shared_size_bytes = int(nbytes)
+
     @property
     def max_threads_per_block(self) -> int:
         return int(self._fn.max_threads_per_block)
@@ -408,6 +413,15 @@ class Kernel:
     def num_regs(self) -> int:
         """Registers per thread (watch this when tuning occupancy)."""
         return int(self._fn.num_regs)
+
+
+def ptr(buf: Buffer, offset: int = 0) -> np.uint64:
+    """Device address of element `offset` of `buf`, as a kernel argument
+    (for kernels that read a strided part of a buffer, e.g. the K columns of
+    a fused Q|K|V projection). The buffer must outlive the launch."""
+    if not 0 <= offset <= buf.size:
+        raise IndexError(f"offset {offset} outside a buffer of {buf.size}")
+    return np.uint64(buf.ptr + offset * buf.dtype.itemsize)
 
 
 def compile_kernel(source: str, name: str, defines: dict | None = None,

@@ -121,6 +121,29 @@ def test_fp16_close_to_cpu():
         assert cos > 0.99, (name, cos)
 
 
+@pytest.mark.parametrize("attention_bias", [True, False])
+def test_fused_attention_matches_unfused(attention_bias):
+    """fp16, dropout on: both attention paths use the same dropout masks
+    (same seeds, same element indices), so they must agree to rounding.
+    GELU, because with ReLU and a tiny batch one unit sitting at ~0 can flip
+    sign between two roundings and move a few gradients by several %."""
+    cfg = small_config(dropout=0.1, activation="gelu",
+                       attention_bias=attention_bias)
+    _, fused = build(cfg, precision="fp16")
+    _, plain = build(cfg, precision="fp16", fused_attention=False)
+    assert fused.k_attn and not plain.k_attn      # the paths really differ
+    src, tgt_in, tgt_out = batch(cfg)
+    fused.forward_backward(src, tgt_in, tgt_out)
+    plain.forward_backward(src, tgt_in, tgt_out)
+    assert fused.last_loss() == pytest.approx(plain.last_loss(), rel=2e-3)
+    a, b = fused.gradients(), plain.gradients()
+    for name in a:
+        err = np.linalg.norm(a[name] - b[name]) / (np.linalg.norm(b[name]) + 1e-8)
+        # zero-gradient key biases are pure rounding noise in both paths
+        if np.linalg.norm(b[name]) > 1e-4:
+            assert err < 2e-2, (name, err)
+
+
 def test_dropout_gradients_match_finite_differences():
     """Dropout on: the gradient must be the derivative of the GPU's own loss
     under the same masks (checks every dropout backward path)."""

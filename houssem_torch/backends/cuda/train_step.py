@@ -51,6 +51,21 @@ _SOURCE = Path(__file__).with_name("kernels.cu").read_text(encoding="utf-8")
 _THREADS = 256
 _ALIGN = 64          # parameter offsets, in elements (128 B in fp16)
 _LN_EPS = 1e-5       # houssem_torch.nn.LayerNorm default
+_ATT_WARPS = 4       # warps per fused-attention block
+_SMEM_LIMIT = 65536  # dynamic + static shared memory per block on sm_75
+_CE_THREADS = 512    # register-resident cross-entropy block size
+
+
+def _vec_width(n, half, limit=None):
+    """Widest vector (16 bytes max) whose element count divides n."""
+    for w in ((8, 4, 2, 1) if half else (4, 2, 1)):
+        if n % w == 0 and (limit is None or w <= limit):
+            return w
+    return 1
+
+
+def _pad16(n):
+    return -(-n // 16) * 16
 
 
 @dataclass
@@ -91,6 +106,9 @@ class TrainStep:
                   houssem_torch.nn.clip_grad_norm.
     seed:         dropout randomness.
     init_scale, growth_interval: dynamic loss scaling (fp16 only).
+    fused_attention: use the fused tensor-core attention kernels where the
+                  shape allows (fp16, d_k divisible by 8, sequences up to
+                  ~64 tokens); False forces the unfused path everywhere.
     """
 
     def __init__(self, model: Transformer, batch_size: int, src_len: int,
@@ -98,7 +116,8 @@ class TrainStep:
                  betas=(0.9, 0.98), eps: float = 1e-9,
                  weight_decay: float = 0.01, max_grad_norm: float | None = None,
                  seed: int = 0, init_scale: float = 2.0 ** 16,
-                 growth_interval: int = 2000, device: int = 0):
+                 growth_interval: int = 2000, device: int = 0,
+                 fused_attention: bool = True):
         if not drv.is_available():
             raise RuntimeError("TrainStep needs a CUDA GPU and CuPy.")
         if precision not in ("fp16", "fp32"):
@@ -122,6 +141,7 @@ class TrainStep:
         self.weight_decay = float(weight_decay)
         self.max_grad_norm = max_grad_norm
         self.growth_interval = growth_interval
+        self.fused_attention = bool(fused_attention)
         self.d = cfg.d_model
         self.H = cfg.n_heads
         self.dk = cfg.d_model // cfg.n_heads
@@ -175,28 +195,75 @@ class TrainStep:
                                   {"USE_HALF": int(self.half), **defines})
 
     def _compile(self):
-        cfg, d = self.cfg, self.d
+        cfg, d, half = self.cfg, self.d, self.half
         self.ln_warps = max(1, min(8, 6144 // d))
+        vw = _vec_width(d // 32, half)
+        evw = _vec_width(cfg.d_ff, half)
+        if cfg.d_ff // evw > 1024:
+            raise ValueError(f"d_ff {cfg.d_ff} too wide for the FFN kernels")
         act = {"relu": 0, "gelu": 1}[cfg.activation]
-        self.k_embed_ln = self._kernel("add_ln_fwd", D=d, MODE=0)
-        self.k_res_ln = self._kernel("add_ln_fwd", D=d, MODE=1)
-        self.k_ln_bwd = self._kernel("ln_bwd", D=d, LN_WARPS=self.ln_warps)
+        self.k_embed_ln = self._kernel("add_ln_fwd", D=d, VW=vw, MODE=0)
+        self.k_res_ln = self._kernel("add_ln_fwd", D=d, VW=vw, MODE=1)
+        self.k_ln_bwd = self._kernel("ln_bwd", D=d, VW=vw, LN_WARPS=self.ln_warps)
         self.k_embed_bwd = self._kernel("embed_bwd")
-        self.k_bias_act = self._kernel("bias_act_fwd", ACT=act)
-        self.k_act_bwd = self._kernel("act_bwd", ACT=act)
+        self.evw = evw
+        self.k_bias_act = self._kernel("bias_act_fwd", ACT=act, EVW=evw)
+        self.k_act_bwd = self._kernel("act_bwd", ACT=act, EVW=evw)
         self.k_split = self._kernel("split_heads")
         self.k_merge = self._kernel("merge_heads")
-        self.k_softmax, self.k_softmax_bwd = {}, {}
-        for lk, causal in {(self.S, 0), (self.T, 1), (self.S, 0)}:
-            self.k_softmax[lk, causal] = self._kernel("softmax_fwd", LK=lk,
-                                                      CAUSAL=causal)
-            self.k_softmax_bwd[lk, causal] = self._kernel("softmax_bwd", LK=lk,
-                                                          CAUSAL=causal)
+        # Attention: fused kernels per (queries, keys, causal) where they fit,
+        # the unfused path (cuBLAS + softmax kernels) elsewhere.
+        self.k_softmax, self.k_softmax_bwd, self.k_attn = {}, {}, {}
+        for lq, lk, causal in {(self.S, self.S, 0), (self.T, self.T, 1),
+                               (self.T, self.S, 0)}:
+            fused = self._fused_attention_plan(lq, lk)
+            if fused is not None:
+                fwd_smem, bwd_smem = fused
+                defs = dict(ATT=1, AQ=lq, AK=lk, AQP=_pad16(lq), AKP=_pad16(lk),
+                            DK=self.dk, CAUSAL=causal, NW=_ATT_WARPS)
+                kf = self._kernel("attn_fwd", **defs)
+                kb = self._kernel("attn_bwd", **defs)
+                kf.set_max_dynamic_shared(fwd_smem)
+                kb.set_max_dynamic_shared(bwd_smem)
+                self.k_attn[lq, lk, causal] = (kf, kb, fwd_smem, bwd_smem)
+            else:
+                self.k_softmax[lk, causal] = self._kernel(
+                    "softmax_fwd", LK=lk, CAUSAL=causal)
+                self.k_softmax_bwd[lk, causal] = self._kernel(
+                    "softmax_bwd", LK=lk, CAUSAL=causal)
+        V = cfg.vocab_size
+        ce_vw = _vec_width(V, half)
+        if -(-V // (_CE_THREADS * ce_vw)) * ce_vw <= 64:
+            self.k_ce_reg = self._kernel("cross_entropy_reg", CE_V=V,
+                                         CE_T=_CE_THREADS, CE_VW=ce_vw)
+        else:
+            self.k_ce_reg = None
         self.k_ce = self._kernel("cross_entropy")
         self.k_reset = self._kernel("reset_scalars")
         self.k_sumsq = self._kernel("sum_squares")
         self.k_prepare = self._kernel("step_prepare")
         self.k_adamw = self._kernel("adamw")
+
+    def _fused_attention_plan(self, lq, lk):
+        """(forward, backward) dynamic shared bytes of the fused attention
+        kernels for this shape, or None if they don't apply."""
+        if not (self.fused_attention and self.half and self.dk % 8 == 0):
+            return None
+        qp, kp, dk = _pad16(lq), _pad16(lk), self.dk
+        lds, ldp = dk + 8, kp + 8
+        fwd = 2 * (qp + 2 * kp) * lds
+        bwd = 2 * ((2 * qp + 2 * kp) * lds + 2 * qp * ldp)
+        static = 4 * kp + 4 * qp + 12 * dk
+        if bwd + static > _SMEM_LIMIT:
+            return None
+        return fwd, bwd
+
+    def _attn(self, sub, st):
+        """Fused kernels for this attention sublayer, or None."""
+        if sub.kind not in ("self", "cross"):
+            return None
+        lk = self.S if sub.kind == "cross" else st.L
+        return self.k_attn.get((st.L, lk, int(sub.causal)))
 
     def _buf(self, key, shape, dtype=None):
         """A buffer allocated on first use and reused every step."""
@@ -264,7 +331,16 @@ class TrainStep:
         B, H, dk, d = self.B, self.H, self.dk, self.d
         BH, L = B * H, st.L
         z = lambda *shape: drv.zeros(shape, self.dtype)  # noqa: E731
-        if sub.kind == "self":
+        if self._attn(sub, st) is not None:
+            # fused: keep the raw projections, the context and one
+            # log-sum-exp per query row; nothing of size L x L.
+            if sub.kind == "self":
+                sub.bufs.update(qkv=z(st.M, 3 * d))
+            else:
+                sub.bufs.update(q=z(st.M, d), kv=z(self.B * self.S, 2 * d))
+            sub.bufs.update(ctx=z(st.M, d),
+                            lse=drv.zeros(2 * B * H * L, np.float32))
+        elif sub.kind == "self":
             sub.bufs.update(heads=z(3, BH, L, dk), P=z(BH, L, L), Pd=z(BH, L, L),
                             ctx=z(st.M, d))
         elif sub.kind == "cross":
@@ -284,6 +360,11 @@ class TrainStep:
 
     def _warp_rows(self, rows):
         return -(-rows * 32 // _THREADS)
+
+    def _ffn_grid(self, rows, cols):
+        """(blocks, threads, rows per block) for bias_act_fwd / act_bwd."""
+        rpb = max(1, -(-rows // (self._sms * 2)))
+        return -(-rows // rpb), cols // self.evw, rpb
 
     def _colsum(self, g, out, rows):
         """out (fp32, (n,)) += sum of g's rows, as a cuBLAS ones-vector multiply."""
@@ -321,10 +402,14 @@ class TrainStep:
         cfg, dec = self.cfg, self.dec
         drv.gemm(dec.h[-1], self.W["embedding.weight"], self.logits, trans_b=True)
         pad = cfg.pad_id
-        self.k_ce(dec.M, _THREADS, self.logits, self.tgt_out_ids, cfg.vocab_size,
-                  float(cfg.label_smoothing),
-                  int(cfg.label_smoothing_mode == "non_target"), pad, pad,
-                  self.scalars, 1.0 / self._count, self.scalars[2:3])
+        args = (float(cfg.label_smoothing),
+                int(cfg.label_smoothing_mode == "non_target"), pad, pad,
+                self.scalars, 1.0 / self._count, self.scalars[2:3])
+        if self.k_ce_reg is not None:
+            self.k_ce_reg(dec.M, _CE_THREADS, self.logits, self.tgt_out_ids, *args)
+        else:
+            self.k_ce(dec.M, _THREADS, self.logits, self.tgt_out_ids,
+                      cfg.vocab_size, *args)
 
     def _ln_names(self, st, k):
         name = st.subs[k].norm if k < len(st.subs) else st.final
@@ -368,11 +453,15 @@ class TrainStep:
         if sub.kind == "ffn":
             u, a = sub.bufs["u"], sub.bufs["a"]
             drv.gemm(h, W[f"{pre}.up.weight"], u)
-            self.k_bias_act(self._grid(u.size), _THREADS, u, W[f"{pre}.up.bias"],
-                            a, M, self.cfg.d_ff, self._seed(sub.inner_seed),
+            blocks, threads, rpb = self._ffn_grid(M, self.cfg.d_ff)
+            self.k_bias_act(blocks, threads, u, W[f"{pre}.up.bias"], a, M,
+                            self.cfg.d_ff, rpb, self._seed(sub.inner_seed),
                             self._p_ffn)
             drv.gemm(a, W[f"{pre}.down.weight"], y)
             return y
+        fused = self._attn(sub, st)
+        if fused is not None:
+            return self._attn_fwd_fused(st, k, sub, fused, y)
         if sub.kind == "self":
             qkv = self._buf(f"{st.name}.qkv", (M, 3 * d))
             heads = sub.bufs["heads"]
@@ -403,6 +492,84 @@ class TrainStep:
         drv.gemm(sub.bufs["ctx"], W[f"{pre}.w_o.weight"], y)
         return y
 
+    def _qkv_parts(self, sub):
+        """Kernel arguments locating Q, K and V inside the raw projection
+        outputs (fused path): pointer, row stride, bias pointer, three times."""
+        W, d, pre = self.W, self.d, sub.prefix
+        if sub.kind == "self":
+            qkv, bias = sub.bufs["qkv"], W.get(f"{pre}.w_qkv.bias")
+            srcs = [(qkv, 3 * d, i * d) for i in range(3)]
+            biases = [(bias, i * d) for i in range(3)]
+        else:
+            q, kv = sub.bufs["q"], sub.bufs["kv"]
+            bq, bkv = W.get(f"{pre}.w_q.bias"), W.get(f"{pre}.w_kv.bias")
+            srcs = [(q, d, 0), (kv, 2 * d, 0), (kv, 2 * d, d)]
+            biases = [(bq, 0), (bkv, 0), (bkv, d)]
+        args = []
+        for (buf, stride, off), (b, boff) in zip(srcs, biases):
+            args += [drv.ptr(buf, off), stride,
+                     drv.ptr(b, boff) if b is not None else None]
+        return args
+
+    def _attn_fwd_fused(self, st, k, sub, fused, y):
+        W, d, pre = self.W, self.d, sub.prefix
+        h = st.h[k]
+        if sub.kind == "self":
+            drv.gemm(h, W[f"{pre}.w_qkv.weight"], sub.bufs["qkv"])
+            kid = st.ids
+        else:
+            drv.gemm(h, W[f"{pre}.w_q.weight"], sub.bufs["q"])
+            drv.gemm(self.enc.h[-1], W[f"{pre}.w_kv.weight"], sub.bufs["kv"])
+            kid = self.src_ids
+        kf, _, fwd_smem, _ = fused
+        kf(self.B * self.H, _ATT_WARPS * 32, *self._qkv_parts(sub), kid,
+           sub.bufs["ctx"], d, sub.bufs["lse"], self.H, self.cfg.pad_id,
+           self._seed(sub.inner_seed), self._p_attn, 1.0 / math.sqrt(self.dk),
+           shared_mem=fwd_smem)
+        drv.gemm(sub.bufs["ctx"], W[f"{pre}.w_o.weight"], y)
+        return y
+
+    def _attn_bwd_fused(self, st, k, sub, fused, g_y, g_h):
+        W, G, d, pre = self.W, self.G, self.d, sub.prefix
+        h, M = st.h[k], st.M
+        ctx = sub.bufs["ctx"]
+        drv.gemm(ctx, g_y, G[f"{pre}.w_o.weight"], trans_a=True, beta=1.0)
+        g_ctx = self._buf(f"{st.name}.gctx", (M, d))
+        drv.gemm(g_y, W[f"{pre}.w_o.weight"], g_ctx, trans_b=True)
+        if sub.kind == "self":
+            g_qkv = self._buf(f"{st.name}.gqkv", (M, 3 * d))
+            outs = [(g_qkv, 3 * d, i * d) for i in range(3)]
+            gb = G.get(f"{pre}.w_qkv.bias")
+            gbias = [(gb, i * d) for i in range(3)]
+            kid = st.ids
+        else:
+            g_q = self._buf("dec.gq", (M, d))
+            g_kv = self._buf("dec.gkv", (self.enc.M, 2 * d))
+            outs = [(g_q, d, 0), (g_kv, 2 * d, 0), (g_kv, 2 * d, d)]
+            gq, gkv = G.get(f"{pre}.w_q.bias"), G.get(f"{pre}.w_kv.bias")
+            gbias = [(gq, 0), (gkv, 0), (gkv, d)]
+            kid = self.src_ids
+        out_args = []
+        for buf, stride, off in outs:
+            out_args += [drv.ptr(buf, off), stride]
+        bias_args = [drv.ptr(b, off) if b is not None else None for b, off in gbias]
+        _, kb, _, bwd_smem = fused
+        kb(self.B * self.H, _ATT_WARPS * 32, *self._qkv_parts(sub), kid,
+           ctx, d, g_ctx, d, sub.bufs["lse"], *out_args, *bias_args,
+           self.H, self.cfg.pad_id, self._seed(sub.inner_seed), self._p_attn,
+           1.0 / math.sqrt(self.dk), shared_mem=bwd_smem)
+        if sub.kind == "self":
+            drv.gemm(h, g_qkv, G[f"{pre}.w_qkv.weight"], trans_a=True, beta=1.0)
+            drv.gemm(g_qkv, W[f"{pre}.w_qkv.weight"], g_h, trans_b=True)
+        else:
+            drv.gemm(h, g_q, G[f"{pre}.w_q.weight"], trans_a=True, beta=1.0)
+            drv.gemm(g_q, W[f"{pre}.w_q.weight"], g_h, trans_b=True)
+            drv.gemm(self.enc.h[-1], g_kv, G[f"{pre}.w_kv.weight"], trans_a=True,
+                     beta=1.0)
+            drv.gemm(g_kv, W[f"{pre}.w_kv.weight"], self._g_mem, trans_b=True,
+                     beta=1.0)                                 # memory grad
+        return g_h
+
     # ------------------------------------------------------------------
     # Backward
     # ------------------------------------------------------------------
@@ -424,7 +591,11 @@ class TrainStep:
                 self._bwd_stack(enc, g_mem)
 
     def _ln_bwd(self, st, k, g_h, accum, prev_seed):
+        """LayerNorm site k backward; also writes the gradient of sublayer
+        k-1's output (and sums its output bias's gradient) when prev_seed
+        is given."""
         name = st.subs[k].norm if k < len(st.subs) else st.final
+        prev_bias = st.subs[k - 1].out_bias if k > 0 else None
         g_x = self._buf(f"{st.name}.gx", (st.M, self.d))
         g_y = self._buf(f"{st.name}.gy", (st.M, self.d))
         blocks = max(1, min(-(-st.M // self.ln_warps), self._sms * 2))
@@ -432,6 +603,8 @@ class TrainStep:
                       st.rstd[k], self.W[name + ".weight"], g_x, int(accum),
                       self.G[name + ".weight"], self.G[name + ".bias"],
                       g_y if prev_seed is not None else None,
+                      self.G[prev_bias] if (prev_seed is not None and prev_bias)
+                      else None,
                       self._seed(prev_seed) if prev_seed is not None else np.uint32(0),
                       self._p_res, st.M)
         return g_x, g_y
@@ -465,21 +638,24 @@ class TrainStep:
         h, L, M, pre = st.h[k], st.L, st.M, sub.prefix
         g_h = self._buf(f"{st.name}.gh", (M, d))
         alpha = 1.0 / math.sqrt(dk)
-        if sub.out_bias:
-            self._colsum(g_y, G[sub.out_bias], M)
+        # The output bias's gradient was already summed by ln_bwd.
         if sub.kind == "ffn":
             dff = self.cfg.d_ff
             drv.gemm(sub.bufs["a"], g_y, G[f"{pre}.down.weight"], trans_a=True,
                      beta=1.0)
             g_a = self._buf(f"{st.name}.ga", (M, dff))
             drv.gemm(g_y, W[f"{pre}.down.weight"], g_a, trans_b=True)
-            self.k_act_bwd(self._grid(g_a.size), _THREADS, g_a, sub.bufs["u"],
-                           M, dff, self._seed(sub.inner_seed), self._p_ffn)
-            self._colsum(g_a, G[f"{pre}.up.bias"], M)
+            blocks, threads, rpb = self._ffn_grid(M, dff)
+            self.k_act_bwd(blocks, threads, g_a, sub.bufs["u"],
+                           G[f"{pre}.up.bias"], M, dff, rpb,
+                           self._seed(sub.inner_seed), self._p_ffn)
             drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
             drv.gemm(g_a, W[f"{pre}.up.weight"], g_h, trans_b=True)
             return g_h
 
+        fused = self._attn(sub, st)
+        if fused is not None:
+            return self._attn_bwd_fused(st, k, sub, fused, g_y, g_h)
         # attention output projection
         ctx = sub.bufs["ctx"]
         drv.gemm(ctx, g_y, G[f"{pre}.w_o.weight"], trans_a=True, beta=1.0)
@@ -570,12 +746,13 @@ class TrainStep:
 
     def _update(self, lr):
         n = self.n_params
-        self.k_sumsq(self._grid(n), _THREADS, self.grad, n, self.scalars[1:2])
+        n4 = n // 4
+        self.k_sumsq(self._grid(n4), _THREADS, self.grad, n4, self.scalars[1:2])
         self.k_prepare(1, 1, self.scalars, self.beta1, self.beta2,
                        float(self.max_grad_norm or 0.0), int(self.half),
                        int(self.growth_interval))
-        self.k_adamw(self._grid(n), _THREADS, self.master, self.grad, self.m,
-                     self.v, self.work, n, self.scalars, float(lr), self.beta1,
+        self.k_adamw(self._grid(n4), _THREADS, self.master, self.grad, self.m,
+                     self.v, self.work, n4, self.scalars, float(lr), self.beta1,
                      self.beta2, self.adam_eps, self.weight_decay, 1)
 
     def __call__(self, src, tgt_in, tgt_out, lr: float) -> None:
