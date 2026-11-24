@@ -16,7 +16,7 @@ cuda-python or a compiled extension without touching the engine.
 
 All matrices are row-major, like NumPy. cuBLAS is column-major; `gemm`
 handles the conversion (a row-major matrix is its own transpose in
-column-major, so C = A·B is computed as Cᵀ = Bᵀ·Aᵀ with no copies).
+column-major, so C = A·B is computed as Cᵀ = B^T·Aᵀ with no copies).
 """
 from __future__ import annotations
 
@@ -162,7 +162,8 @@ class Buffer:
         _cp.copyto(self._arr, other._arr)
 
     def fill_(self, value: float) -> None:
-        self._arr.fill(value)
+        with _Timed("fill"):
+            self._arr.fill(value)
 
     def view(self, *shape: int) -> "Buffer":
         """Same memory, new shape (sizes must match)."""
@@ -261,6 +262,99 @@ class Timer:
 
 
 # ---------------------------------------------------------------------------
+# Profiling: GPU time of every launch, tagged with a region
+# ---------------------------------------------------------------------------
+
+_PROFILER: "Profiler | None" = None
+_REGIONS: list[str] = []
+
+
+class region:
+    """Tag the launches inside this block: `with region("fwd"): ...`.
+    Nested regions join with "/" ("fwd/enc/ffn"). Costs almost nothing
+    when no Profiler is active."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        _REGIONS.append(self.name)
+
+    def __exit__(self, *exc):
+        _REGIONS.pop()
+
+
+@dataclass
+class LaunchRecord:
+    name: str           # kernel name, "gemm", "gemm_batched" or "fill"
+    region: str
+    flops: float        # matrix multiplies only, else 0
+    shape: str          # matrix multiplies: "m×n×k[×batch]"
+    ms: float = 0.0
+
+
+class Profiler:
+    """Times every launch on the GPU (CUDA events around each one).
+
+        with driver.Profiler() as prof:
+            step(...)
+        for r in prof.records(): ...
+
+    The events add a little time between launches, so per-launch times are
+    reliable while the profiled total runs slightly above an unprofiled step.
+    """
+
+    def __init__(self):
+        _require()
+        self._open: list = []
+
+    def __enter__(self) -> "Profiler":
+        global _PROFILER
+        if _PROFILER is not None:
+            raise RuntimeError("a Profiler is already active")
+        _PROFILER = self
+        return self
+
+    def __exit__(self, *exc) -> None:
+        global _PROFILER
+        _PROFILER = None
+
+    def _begin(self, name, flops=0.0, shape=""):
+        a, b = _cp.cuda.Event(), _cp.cuda.Event()
+        a.record()
+        rec = LaunchRecord(name, "/".join(_REGIONS), float(flops), shape)
+        self._open.append((rec, a, b))
+        return b
+
+    def records(self) -> list[LaunchRecord]:
+        """All launches so far, with their GPU time (waits for the GPU)."""
+        if self._open:
+            self._open[-1][2].synchronize()
+        for rec, a, b in self._open:
+            rec.ms = float(_cp.cuda.get_elapsed_time(a, b))
+        return [rec for rec, _, _ in self._open]
+
+
+class _Timed:
+    """Context for one launch: no-op unless a Profiler is active."""
+
+    __slots__ = ("_end",)
+
+    def __init__(self, name, flops=0.0, shape=""):
+        self._end = None if _PROFILER is None else _PROFILER._begin(name, flops,
+                                                                   shape)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self._end is not None:
+            self._end.record()
+
+
+# ---------------------------------------------------------------------------
 # Kernels (NVRTC, compiled at startup)
 # ---------------------------------------------------------------------------
 
@@ -299,8 +393,12 @@ class Kernel:
         """
         grid = grid if isinstance(grid, tuple) else (grid,)
         block = block if isinstance(block, tuple) else (block,)
-        self._fn(grid, block, tuple(_arg(a) for a in args),
-                 shared_mem=shared_mem)
+        args = tuple(_arg(a) for a in args)
+        if _PROFILER is None:
+            self._fn(grid, block, args, shared_mem=shared_mem)
+            return
+        with _Timed(self.name):
+            self._fn(grid, block, args, shared_mem=shared_mem)
 
     @property
     def max_threads_per_block(self) -> int:
@@ -369,6 +467,11 @@ def _gemm_types(a: Buffer, b: Buffer, c: Buffer):
     return _CUDA_TYPE[a.dtype], _CUDA_TYPE[c.dtype]
 
 
+def _shape_label(m, n, k, trans_a, trans_b, batch=None):
+    label = f"{m}x{n}x{k}" + (f" x{batch}" if batch else "")
+    return label + (" A^T" if trans_a else "") + (" B^T" if trans_b else "")
+
+
 def _handle():
     h = _cp.cuda.device.get_cublas_handle()
     _cublas.setStream(h, _current_stream_ptr())
@@ -391,6 +494,11 @@ def gemm(a: Buffer, b: Buffer, c: Buffer, *, trans_a: bool = False,
     al = np.array(alpha, dtype=np.float32)
     be = np.array(beta, dtype=np.float32)
     # Row-major C(m,n) = op(A) op(B)  ⇔  column-major Cᵀ(n,m) = op(B)ᵀ op(A)ᵀ.
+    with _Timed("gemm", 2.0 * m * n * k, _shape_label(m, n, k, trans_a, trans_b)):
+        _gemm_ex(a, b, c, m, n, k, trans_a, trans_b, ab_type, c_type, al, be)
+
+
+def _gemm_ex(a, b, c, m, n, k, trans_a, trans_b, ab_type, c_type, al, be):
     _cublas.gemmEx(
         _handle(), int(trans_b), int(trans_a), n, m, k,
         al.ctypes.data, b.ptr, ab_type, b.shape[1],
@@ -420,6 +528,14 @@ def gemm_batched(a: Buffer, b: Buffer, c: Buffer, *, trans_a: bool = False,
     ab_type, c_type = _gemm_types(a, b, c)
     al = np.array(alpha, dtype=np.float32)
     be = np.array(beta, dtype=np.float32)
+    with _Timed("gemm_batched", 2.0 * m * n * k * batch,
+                _shape_label(m, n, k, trans_a, trans_b, batch)):
+        _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type,
+                      c_type, al, be)
+
+
+def _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type, c_type,
+                  al, be):
     _cublas.gemmStridedBatchedEx(
         _handle(), int(trans_b), int(trans_a), n, m, k,
         al.ctypes.data,

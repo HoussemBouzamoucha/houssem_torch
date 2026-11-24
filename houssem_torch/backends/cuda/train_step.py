@@ -311,9 +311,14 @@ class TrainStep:
         cfg = self.cfg
         self._p_res = self._p_emb = self._p_attn = float(cfg.dropout) if train else 0.0
         self._p_ffn = float(cfg.ffn_dropout_rate) if train else 0.0
-        self._fwd_stack(self.enc)
-        self._fwd_stack(self.dec)
-        dec = self.dec
+        with drv.region("fwd"):
+            self._fwd_stack(self.enc)
+            self._fwd_stack(self.dec)
+        with drv.region("fwd"), drv.region("head"):
+            self._head_forward()
+
+    def _head_forward(self):
+        cfg, dec = self.cfg, self.dec
         drv.gemm(dec.h[-1], self.W["embedding.weight"], self.logits, trans_b=True)
         pad = cfg.pad_id
         self.k_ce(dec.M, _THREADS, self.logits, self.tgt_out_ids, cfg.vocab_size,
@@ -326,21 +331,34 @@ class TrainStep:
         return self.W[name + ".weight"], self.W[name + ".bias"]
 
     def _fwd_stack(self, st):
+        with drv.region(st.name):
+            self._fwd_stack_inner(st)
+
+    def _fwd_stack_inner(self, st):
         w, b = self._ln_names(st, 0)
+        with drv.region("embed"):
+            self._embed_ln(st, w, b)
+        for k, sub in enumerate(st.subs):
+            with drv.region(sub.kind):
+                y = self._sub_fwd(st, k, sub)
+            with drv.region("residual_ln"):
+                self._residual_ln(st, k, sub, y)
+
+    def _embed_ln(self, st, w, b):
         self.k_embed_ln(self._warp_rows(st.M), _THREADS,
                         None, None, None, st.ids, self.W["embedding.weight"],
                         self.pe, st.L, self.emb_scale,
                         st.x[0], st.h[0], st.mean[0], st.rstd[0], w, b,
                         st.M, self._seed(st.emb_seed), self._p_emb, _LN_EPS)
-        for k, sub in enumerate(st.subs):
-            y = self._sub_fwd(st, k, sub)
-            w, b = self._ln_names(st, k + 1)
-            ybias = self.W[sub.out_bias] if sub.out_bias else None
-            self.k_res_ln(self._warp_rows(st.M), _THREADS,
-                          st.x[k], y, ybias, None, None, None, 0, 0.0,
-                          st.x[k + 1], st.h[k + 1], st.mean[k + 1],
-                          st.rstd[k + 1], w, b, st.M,
-                          self._seed(sub.res_seed), self._p_res, _LN_EPS)
+
+    def _residual_ln(self, st, k, sub, y):
+        w, b = self._ln_names(st, k + 1)
+        ybias = self.W[sub.out_bias] if sub.out_bias else None
+        self.k_res_ln(self._warp_rows(st.M), _THREADS,
+                      st.x[k], y, ybias, None, None, None, 0, 0.0,
+                      st.x[k + 1], st.h[k + 1], st.mean[k + 1],
+                      st.rstd[k + 1], w, b, st.M,
+                      self._seed(sub.res_seed), self._p_res, _LN_EPS)
 
     def _sub_fwd(self, st, k, sub):
         W, d, H, dk, BH = self.W, self.d, self.H, self.dk, self.B * self.H
@@ -393,13 +411,17 @@ class TrainStep:
         dec, enc = self.dec, self.enc
         E, gE = self.W["embedding.weight"], self.G["embedding.weight"]
         g_h = self._buf("dec.gh_final", (dec.M, self.d))
-        drv.gemm(self.logits, E, g_h)                                  # dh = dl·E
-        drv.gemm(self.logits, dec.h[-1], gE, trans_a=True, beta=1.0)   # dE += dlᵀ·h
+        with drv.region("bwd"), drv.region("head"):
+            drv.gemm(self.logits, E, g_h)                                # dh = dl·E
+            drv.gemm(self.logits, dec.h[-1], gE, trans_a=True, beta=1.0)  # dE += dlᵀ·h
         g_mem = self._buf("enc.gh_final", (enc.M, self.d))
-        g_mem.fill_(0)
-        self._g_mem = g_mem
-        self._bwd_stack(dec, g_h)
-        self._bwd_stack(enc, g_mem)
+        with drv.region("bwd"):
+            g_mem.fill_(0)
+            self._g_mem = g_mem
+            with drv.region("dec"):
+                self._bwd_stack(dec, g_h)
+            with drv.region("enc"):
+                self._bwd_stack(enc, g_mem)
 
     def _ln_bwd(self, st, k, g_h, accum, prev_seed):
         name = st.subs[k].norm if k < len(st.subs) else st.final
@@ -417,13 +439,20 @@ class TrainStep:
     def _bwd_stack(self, st, g_h_final):
         K = len(st.subs)
         prev = st.subs[K - 1].res_seed if K else None
-        g_x, g_y = self._ln_bwd(st, K, g_h_final, False, prev)
+        with drv.region("residual_ln"):
+            g_x, g_y = self._ln_bwd(st, K, g_h_final, False, prev)
         for k in range(K - 1, -1, -1):
-            g_h = self._sub_bwd(st, k, st.subs[k], g_y)
+            with drv.region(st.subs[k].kind):
+                g_h = self._sub_bwd(st, k, st.subs[k], g_y)
             prev = st.subs[k - 1].res_seed if k > 0 else None
-            self._ln_bwd(st, k, g_h, True, prev)
+            with drv.region("residual_ln"):
+                self._ln_bwd(st, k, g_h, True, prev)
         pad_idx = self.cfg.pad_id if self.cfg.embedding_padding_idx else -1
         n = st.M * self.d
+        with drv.region("embed"):
+            self._embed_bwd(st, g_x, n, pad_idx)
+
+    def _embed_bwd(self, st, g_x, n, pad_idx):
         self.k_embed_bwd(self._grid(n), _THREADS, g_x, st.ids,
                          self.G["embedding.weight"], st.M, self.d,
                          self._seed(st.emb_seed), self._p_emb, self.emb_scale,
@@ -528,13 +557,18 @@ class TrainStep:
         self._load_batch(src, tgt_in, tgt_out)
         self._seeds = self._rng.integers(0, 2 ** 32, size=self._n_seeds,
                                          dtype=np.uint32)
-        self.grad.fill_(0)
-        self.k_reset(1, 1, self.scalars)
+        with drv.region("optimizer"):
+            self.grad.fill_(0)
+            self.k_reset(1, 1, self.scalars)
         self._forward(train)
         self._backward()
 
     def update(self, lr: float) -> None:
         """Gradient norm, loss-scale bookkeeping, clipping and AdamW."""
+        with drv.region("optimizer"):
+            self._update(lr)
+
+    def _update(self, lr):
         n = self.n_params
         self.k_sumsq(self._grid(n), _THREADS, self.grad, n, self.scalars[1:2])
         self.k_prepare(1, 1, self.scalars, self.beta1, self.beta2,
