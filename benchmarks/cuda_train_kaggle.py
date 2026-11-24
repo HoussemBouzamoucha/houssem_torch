@@ -379,9 +379,9 @@ def train_torch(mode):
     for i, b in enumerate(train_stream(TRAIN_STEPS), start=1):
         loss = step(to_torch(b), noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
-            el = time.perf_counter() - t0
-            log.append((i, float(loss), el))
-            print(f"[torch {mode}] step {i:6d}  loss {float(loss):.4f}  "
+            el, lv = time.perf_counter() - t0, loss.detach().item()
+            log.append((i, lv, el))
+            print(f"[torch {mode}] step {i:6d}  loss {lv:.4f}  "
                   f"{el:7.1f}s", flush=True)
     torch.cuda.synchronize(torch_dev)
     wall = time.perf_counter() - t0

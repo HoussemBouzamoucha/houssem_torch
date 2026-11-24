@@ -315,6 +315,37 @@ un-profiled), so the shares are reliable and the per-category ms are not.
 - Several batch sizes: idle time and the head's share depend on them.
 - Repeat runs on Kaggle's T4s to bound the noise (one Colab run so far).
 
+### 7.5 First houssem_torch GPU step on a T4 (2026-11-24)
+
+Raw output: [`benchmarks/t4/2026-11-24_kaggle_t4_trainstep.md`](benchmarks/t4/2026-11-24_kaggle_t4_trainstep.md).
+`TrainStep` v1 (compiled whole step, cuBLAS + own fused kernels via CuPy),
+same model, batch shape and settings as §7.1, real opus_books batches,
+identical initial weights for both engines.
+
+| | houssem_torch | `torch.compile` | eager |
+|---|---:|---:|---:|
+| ms/step | 101.8 | 100.7 | 120.9 |
+| setup / compile | 0.5 s | 42.9 s | — |
+| val loss after 3000 steps | 4.764 | 4.790 | — |
+
+1. **Correct and trains identically.** 25 GPU tests pass on the T4; same
+   loss from the same weights (10.32002 vs 10.31998); loss curves agree
+   within noise over 3000 steps.
+2. **Parity with `torch.compile` using explicit attention.** v1 computes
+   attention as batched QKᵀ, a softmax kernel and batched PV, which cost
+   PyTorch 13% on the compiled step (§7.3.6). So the rest of the step is
+   already ahead of Inductor's, and fused attention is the first lever.
+3. **Known headroom in v1:** bias gradients as 66 extra tiny matmuls; head
+   split/merge copies (84 launches); full fp16 logits written and read back;
+   no fusion into the matmuls; optimizer reads/writes ~1.4 GB per step.
+4. **Padding is the largest real-world cost.** Real batches fill only
+   1471 of 4096 target slots (36%). A plan per length bucket (one compiled
+   step per shape, built in ~0.5 s each) fits the startup-specialization
+   design; `torch.compile` pays a recompile per new shape.
+
+Next: per-launch profile of the step on the T4
+(`benchmarks/trainstep_profile.py`) to rank these before writing kernels.
+
 ---
 
 ## Sources
