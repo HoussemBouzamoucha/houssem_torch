@@ -60,6 +60,12 @@ sh(f"git -C {REPO_DIR} log -1 --oneline")
 for p in (REPO_DIR, f"{REPO_DIR}/benchmarks"):
     if p not in sys.path:
         sys.path.insert(0, p)
+# A notebook keeps modules imported by an earlier run in memory: drop them so
+# the code just pulled is what runs (otherwise git pull changes nothing).
+for name in list(sys.modules):
+    if (name == "houssem_torch" or name.startswith("houssem_torch.")
+            or name in ("t4_profile", "trainstep_profile")):
+        del sys.modules[name]
 
 # %% Cell 3: dependencies and GPUs
 try:
@@ -88,7 +94,7 @@ print("PyTorch", torch.__version__, "on cuda:%d" % TORCH_GPU)
 
 # %% Cell 4: correctness tests on this GPU (GPU step vs CPU Transformer)
 sh(f"{sys.executable} -m pytest -q -p no:warnings tests/test_cuda_driver.py "
-   "tests/test_cuda_train_step.py", cwd=REPO_DIR)
+   "tests/test_cuda_attention.py tests/test_cuda_train_step.py", cwd=REPO_DIR)
 
 # %% Cell 5: download opus_books and split
 from datasets import load_dataset
@@ -279,6 +285,9 @@ def free_gpu():
 # %% Cell 9: same model? loss of both engines on one batch, dropout off
 probe = val_batches[0]
 ht_step, ht_build_s = build_ht()
+fused = sorted(ht_step.k_attn)
+print(f"houssem_torch attention: fused tensor-core kernels for "
+      f"{len(fused)}/3 shapes {fused} (query len, key len, causal)")
 ht_eval = ht_step.evaluate(*probe)
 tm, _, _ = build_torch(init_state)
 tm.eval()
