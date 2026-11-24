@@ -343,8 +343,52 @@ identical initial weights for both engines.
    step per shape, built in ~0.5 s each) fits the startup-specialization
    design; `torch.compile` pays a recompile per new shape.
 
-Next: per-launch profile of the step on the T4
-(`benchmarks/trainstep_profile.py`) to rank these before writing kernels.
+### 7.6 Where the GPU step's time goes (2026-11-24)
+
+Raw output: [`benchmarks/t4/2026-11-24_kaggle_t4_trainstep_profile.md`](benchmarks/t4/2026-11-24_kaggle_t4_trainstep_profile.md)
+(`benchmarks/trainstep_profile.py`, CUDA events around each of the 592
+launches; profiled sum 112.4 ms vs 111.4 ms unprofiled, so the GPU is never
+idle). That session's T4 was ~10% slower than the benchmark session (111.4
+vs 101.8 ms, same shapes and code): compare shares, and always time PyTorch
+in the same session.
+
+| work | ms | share | note |
+|---|---:|---:|---|
+| linear matmuls (cuBLAS) | 45.2 | 40% | 20–26 TFLOP/s, fine |
+| **head split / merge copies** | **13.8** | **12%** | pure layout copies |
+| **attention batched matmuls** | **10.7** | **10%** | 64×64×64 tiles: 2.7 TFLOP/s |
+| optimizer | 9.0 | 8% | AdamW ~170 GB/s |
+| residual + dropout + LayerNorm | 7.8 | 7% | ~155 GB/s |
+| FFN bias + activation + dropout | 7.4 | 7% | ~150 GB/s |
+| output projection matmuls | 7.0 | 6% | 27–32 TFLOP/s |
+| cross-entropy | 4.0 | 4% | ~135 GB/s (3 reads of 134 MB logits) |
+| bias-gradient matmuls | 3.5 | 3% | 0.1–0.2 TFLOP/s |
+| attention softmax | 2.8 | 2% | |
+
+Findings:
+1. **Attention as written is the biggest waste: 27 ms (25%)**, as head
+   copies 13.8, tiny batched matmuls 10.7 and softmax 2.8. The useful work is
+   ~0.2 TFLOP. A fused kernel that reads Q/K/V straight from the projection
+   output, keeps one (batch, head) tile in shared memory (64 × 64 fits
+   easily) and writes the context back in merged layout removes all three.
+   Estimate: 27 → ~8–10 ms.
+2. **Our memory-bound kernels run at ~135–170 GB/s, about half the T4's
+   320 GB/s.** They use scalar fp16 loads and per-element index math.
+   128-bit vectorized loads (8 × fp16) and loading each cross-entropy row
+   once into shared memory should give ~1.6–2× on ~27 ms of kernels
+   (AdamW, LayerNorm fwd/bwd, bias + activation fwd/bwd, cross-entropy).
+   Estimate: save ~10–12 ms.
+3. **Bias gradients don't belong in cuBLAS** (0.1 TFLOP/s): the column sums
+   can be done inside kernels that already read those gradients (`ln_bwd`
+   writes the residual branch's gradient, `act_bwd` the FFN one, the
+   attention backward the Q/K/V one). Save ~3 ms.
+4. **cuBLAS linear matmuls are fine** at 20–26 TFLOP/s; not a target.
+5. **Batch size barely matters:** 25.3k / 26.8k / 28.5k / 26.7k tokens/s at
+   batch 32 / 64 / 96 / 128. The step scales linearly, so there is no launch
+   overhead to amortize; 96 is marginally best.
+
+Together 1–3 put the step at ~75–85 ms against `torch.compile`'s 100.7 ms,
+which matches the §7.5 estimate. Length buckets (§7.5.4) come on top.
 
 ---
 
