@@ -204,3 +204,21 @@ def test_rejects_wrong_batch_shape():
     src, tgt_in, tgt_out = batch(cfg)
     with pytest.raises(ValueError):
         step(src[:, :-1], tgt_in, tgt_out, lr=1e-3)
+
+
+def test_queued_steps_match_synchronized_steps():
+    """Steps queued back to back (batch uploads that do not wait for the
+    GPU) must train exactly like steps with a host sync after each one."""
+    cfg = small_config()
+    batches = [batch(cfg, seed=s) for s in range(6)]
+    _, queued = build(cfg, precision="fp16")
+    for b in batches:
+        queued(*b, lr=3e-3)
+    _, synced = build(cfg, precision="fp16")
+    for b in batches:
+        synced(*b, lr=3e-3)
+        synced.last_loss()
+    got, ref = queued.state_dict(), synced.state_dict()
+    for k in ref:  # float atomics in the bias gradients: rounding only
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-6,
+                                   err_msg=k)

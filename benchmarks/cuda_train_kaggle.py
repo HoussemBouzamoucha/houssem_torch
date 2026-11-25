@@ -182,6 +182,31 @@ def batches(data, epoch_seed, B=BATCH):
         yield to_batch([data[j] for j in idx[i:i + B]])
 
 
+class Timed:
+    """Iterator wrapper adding up the host time spent producing items."""
+
+    def __init__(self, it):
+        self.it, self.s = iter(it), 0.0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        t = time.perf_counter()
+        try:
+            return next(self.it)
+        finally:
+            self.s += time.perf_counter() - t
+
+
+def sm_clock(idx):
+    """Current SM clock of GPU idx, e.g. '1590 MHz' ('?' if unavailable)."""
+    r = subprocess.run(f"nvidia-smi -i {idx} --query-gpu=clocks.sm "
+                       "--format=csv,noheader", shell=True,
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "?"
+
+
 def train_stream(n_steps):
     """The same n_steps batches, in the same order, for both engines."""
     epoch, made = 0, 0
@@ -463,12 +488,14 @@ def val_loss_ht(step):
 def train_ht():
     step, _ = build_ht()
     log, t0 = [], time.perf_counter()
-    for i, b in enumerate(train_stream(TRAIN_STEPS), start=1):
+    stream = Timed(train_stream(TRAIN_STEPS))
+    for i, b in enumerate(stream, start=1):
         step(*b, lr=noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
             loss, el = step.last_loss(), time.perf_counter() - t0
             log.append((i, loss, el))
             print(f"[houssem] step {i:6d}  loss {loss:.4f}  {el:7.1f}s  "
+                  f"data {stream.s:5.1f}s  {sm_clock(HT_GPU)}  "
                   f"scale {step.stats()['loss_scale']:.0f}", flush=True)
     drv.synchronize()
     wall = time.perf_counter() - t0
@@ -491,13 +518,15 @@ def train_torch(mode):
     model, opt, scaler = build_torch(init_state)
     step = torch_step_fn(model, opt, scaler, mode)
     log, t0 = [], time.perf_counter()
-    for i, b in enumerate(train_stream(TRAIN_STEPS), start=1):
+    stream = Timed(train_stream(TRAIN_STEPS))
+    for i, b in enumerate(stream, start=1):
         loss = step(to_torch(b), noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
             el, lv = time.perf_counter() - t0, loss.detach().item()
             log.append((i, lv, el))
             print(f"[torch {mode}] step {i:6d}  loss {lv:.4f}  "
-                  f"{el:7.1f}s", flush=True)
+                  f"{el:7.1f}s  data {stream.s:5.1f}s  "
+                  f"{sm_clock(TORCH_GPU)}", flush=True)
     torch.cuda.synchronize(torch_dev)
     wall = time.perf_counter() - t0
     model.eval()

@@ -290,6 +290,17 @@ class TrainStep:
         self.src_ids = drv.zeros((B, self.S), np.int32)
         self.tgt_in_ids = drv.zeros((B, self.T), np.int32)
         self.tgt_out_ids = drv.zeros((B, self.T), np.int32)
+        # Two pinned host slots for the ids: a batch's upload is queued
+        # behind the previous step without the host waiting for the GPU (an
+        # upload from pageable memory would wait), so the next step's
+        # launches overlap the current step. A slot is refilled only after
+        # the GPU has consumed its last upload.
+        self._stage = [tuple(drv.pinned_empty(b.shape, np.int32) for b in
+                             (self.src_ids, self.tgt_in_ids, self.tgt_out_ids))
+                       for _ in range(2)]
+        self._stage_done = [drv.Event(), drv.Event()]
+        self._stage_used = [False, False]
+        self._slot = 0
         self.pe = drv.from_numpy(sinusoidal_position_encoding(cfg.max_len, d))
         ones = np.ones(B * max(self.S, self.T), self.dtype)
         self.ones = drv.from_numpy(ones)
@@ -733,9 +744,17 @@ class TrainStep:
             if a.shape != want[name]:
                 raise ValueError(f"{name} must have shape {want[name]} (the "
                                  f"shape this step was built for), got {a.shape}")
-        self.src_ids.copy_from(src)
-        self.tgt_in_ids.copy_from(tgt_in)
-        self.tgt_out_ids.copy_from(tgt_out)
+        slot = self._slot
+        self._slot ^= 1
+        if self._stage_used[slot]:
+            self._stage_done[slot].synchronize()
+        host = self._stage[slot]
+        for h, a, buf in zip(host, (src, tgt_in, tgt_out),
+                             (self.src_ids, self.tgt_in_ids, self.tgt_out_ids)):
+            h[...] = a
+            buf.copy_from_async(h)
+        self._stage_done[slot].record()
+        self._stage_used[slot] = True
         self._count = max(int((tgt_out != self.cfg.pad_id).sum()), 1)
 
     def forward_backward(self, src, tgt_in, tgt_out, train: bool = True) -> None:
