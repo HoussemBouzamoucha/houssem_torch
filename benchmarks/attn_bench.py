@@ -14,12 +14,15 @@ Reports the median of several timed runs per kernel, for the non-causal
 import argparse
 import math
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 
-from houssem_torch.backends.cuda import driver
-from houssem_torch.backends.cuda.train_step import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # run from anywhere
+
+from houssem_torch.backends.cuda import driver  # noqa: E402
+from houssem_torch.backends.cuda.train_step import (  # noqa: E402
     _ATT_BWD_WARPS, _ATT_WARPS, _SOURCE, _pad16, attn_smem)
 
 
