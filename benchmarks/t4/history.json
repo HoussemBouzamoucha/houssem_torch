@@ -1,0 +1,550 @@
+{
+ "_about": "Every Kaggle T4 benchmark run of the houssem_torch GPU TrainStep vs PyTorch, oldest first. Script: benchmarks/cuda_train_kaggle.py. Times in ms per training step (median of 3 x 30 steps, real batches) unless noted. Compare runs only by ratios within a run: Kaggle T4s vary ~10-15% between sessions and cards (power cap, cooling); cuda:0 has measured slower. Fairest setup: both engines on the same card (HT_GPU=TORCH_GPU=1).",
+ "setup": {
+  "gpu": "Tesla T4 (sm_75, 40 SMs, 16 GB), Kaggle 2 x T4, driver 580.178",
+  "pytorch": "2.11.0+cu130",
+  "model": "transformer_base: d_model 512, 8 heads, d_ff 2048, 6+6 layers, pre-norm, shared 16384-token embedding",
+  "parameters": 52529152,
+  "batch": "64 x 64/64 tokens, fp16 mixed precision, 1471 target tokens/batch",
+  "data": "opus_books fr->en, 115790 training pairs"
+ },
+ "runs": [
+  {
+   "date": "2026-11-24",
+   "time_utc+1": null,
+   "commit": "0af6946",
+   "branch": "gpu/driver-layer",
+   "gpus": {
+    "houssem_torch": "cuda:0",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "25 passed",
+   "step_ms": {
+    "64": {
+     "houssem_torch": 101.8,
+     "torch.compile": 100.7,
+     "PyTorch eager": 120.9
+    }
+   },
+   "speedup_vs_compile_b64": 0.989,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 42.9
+   },
+   "memory_gb": {
+    "houssem_torch": 2.26,
+    "torch.compile": 2.19,
+    "PyTorch eager": null
+   },
+   "breakdown_ms_b64": null,
+   "training_3000_steps": {
+    "val_loss": {
+     "houssem_torch": 4.764,
+     "torch.compile": 4.79
+    }
+   },
+   "notes": "GPU TrainStep v1: unfused attention, no epilogue fusion. Baseline."
+  },
+  {
+   "date": "2026-11-24",
+   "time_utc+1": null,
+   "commit": "839ffd6",
+   "branch": "gpu/driver-layer",
+   "gpus": {
+    "houssem_torch": "cuda:0",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "32 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 45.8,
+     "torch.compile": 56.5,
+     "PyTorch eager": 68.5
+    },
+    "64": {
+     "houssem_torch": 84.1,
+     "torch.compile": 101.7,
+     "PyTorch eager": 123.1
+    },
+    "96": {
+     "houssem_torch": 121.3,
+     "torch.compile": 160.5,
+     "PyTorch eager": 183.8
+    }
+   },
+   "speedup_vs_compile_b64": 1.209,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 34.5
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.19,
+    "PyTorch eager": null
+   },
+   "breakdown_ms_b64": null,
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 276,
+     "torch.compile": 335
+    },
+    "val_loss": {
+     "houssem_torch": 4.771,
+     "torch.compile": 4.781
+    },
+    "wall_speedup": 1.214
+   },
+   "notes": "v2: fused tensor-core attention, vectorized kernels, fused bias grads. Attention 16.8 ms vs torch 10.2. Full data in reports/2026-11-24_gpu_trainstep_vs_pytorch/data/results.json."
+  },
+  {
+   "date": "2026-11-25",
+   "time_utc+1": "16:31",
+   "commit": "3156790",
+   "branch": "gpu/attention-v3",
+   "gpus": {
+    "houssem_torch": "cuda:0",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "31 + 42 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 43.8,
+     "torch.compile": 56.2,
+     "PyTorch eager": 68.2
+    },
+    "64": {
+     "houssem_torch": 81.1,
+     "torch.compile": 102.4,
+     "PyTorch eager": 122.5
+    },
+    "96": {
+     "houssem_torch": 116.7,
+     "torch.compile": 164.4,
+     "PyTorch eager": 184.3
+    }
+   },
+   "speedup_vs_compile_b64": 1.263,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 30.5
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.19,
+    "PyTorch eager": 2.68
+   },
+   "breakdown_ms_b64": {
+    "matrix multiplies": {
+     "houssem_torch": 49.3,
+     "torch.compile": 52.3,
+     "PyTorch eager": 49.1
+    },
+    "attention": {
+     "houssem_torch": 11.5,
+     "torch.compile": 10.2,
+     "PyTorch eager": 17.2
+    },
+    "LayerNorm + residual": {
+     "houssem_torch": 5.3,
+     "torch.compile": 11.1,
+     "PyTorch eager": 5.4
+    },
+    "activation, dropout, bias": {
+     "houssem_torch": 5.4,
+     "torch.compile": 12.9,
+     "PyTorch eager": 41.4
+    },
+    "loss": {
+     "houssem_torch": 1.1,
+     "torch.compile": 4.6,
+     "PyTorch eager": 0.0
+    },
+    "optimizer": {
+     "houssem_torch": 7.5,
+     "torch.compile": 11.1,
+     "PyTorch eager": 9.0
+    },
+    "embedding, other": {
+     "houssem_torch": 1.1,
+     "torch.compile": 0.4,
+     "PyTorch eager": 0.4
+    }
+   },
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 260,
+     "torch.compile": 333
+    },
+    "val_loss": {
+     "houssem_torch": 4.7691,
+     "torch.compile": 4.7909
+    },
+    "wall_speedup": 1.281
+   },
+   "notes": "ldmatrix attention kernels, 8-warp backward.",
+   "attn_bench_us": {
+    "shape": "B=64 H=8 L=64 DK=64 p=0.1",
+    "afbb189 bwd 4 warps": {
+     "causal0": [
+      243.6,
+      873.4
+     ],
+     "causal1": [
+      155.8,
+      525.1
+     ]
+    },
+    "3156790 bwd 4 warps": {
+     "causal0": [
+      156.8,
+      495.3
+     ],
+     "causal1": [
+      152.2,
+      483.5
+     ]
+    },
+    "3156790 bwd 8 warps": {
+     "causal0": [
+      156.5,
+      346.6
+     ],
+     "causal1": [
+      153.0,
+      347.4
+     ]
+    },
+    "3156790 bwd 16 warps": {
+     "causal0": [
+      157.0,
+      303.4
+     ],
+     "causal1": [
+      152.7,
+      302.3
+     ]
+    },
+    "_format": "[attn_fwd us, attn_bwd us]"
+   }
+  },
+  {
+   "date": "2026-11-25",
+   "time_utc+1": "17:43",
+   "commit": "35525b2",
+   "branch": "gpu/attention-v3",
+   "gpus": {
+    "houssem_torch": "cuda:0",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "36 + 47 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 42.7,
+     "torch.compile": 54.4,
+     "PyTorch eager": 67.1
+    },
+    "64": {
+     "houssem_torch": 77.2,
+     "torch.compile": 94.9,
+     "PyTorch eager": 117.8
+    },
+    "96": {
+     "houssem_torch": 109.9,
+     "torch.compile": 135.2,
+     "PyTorch eager": 167.7
+    }
+   },
+   "speedup_vs_compile_b64": 1.229,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 30.9
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.19,
+    "PyTorch eager": 2.68
+   },
+   "breakdown_ms_b64": {
+    "matrix multiplies": {
+     "houssem_torch": 47.5,
+     "torch.compile": 42.9,
+     "PyTorch eager": 40.4
+    },
+    "attention": {
+     "houssem_torch": 8.9,
+     "torch.compile": 9.6,
+     "PyTorch eager": 17.2
+    },
+    "LayerNorm + residual": {
+     "houssem_torch": 5.4,
+     "torch.compile": 12.2,
+     "PyTorch eager": 5.4
+    },
+    "activation, dropout, bias": {
+     "houssem_torch": 5.5,
+     "torch.compile": 12.9,
+     "PyTorch eager": 44.3
+    },
+    "loss": {
+     "houssem_torch": 1.1,
+     "torch.compile": 4.7,
+     "PyTorch eager": 0.0
+    },
+    "optimizer": {
+     "houssem_torch": 7.7,
+     "torch.compile": 12.1,
+     "PyTorch eager": 10.0
+    },
+    "embedding, other": {
+     "houssem_torch": 1.1,
+     "torch.compile": 0.4,
+     "PyTorch eager": 0.4
+    }
+   },
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 289,
+     "torch.compile": 302
+    },
+    "val_loss": {
+     "houssem_torch": 4.7814,
+     "torch.compile": 4.7815
+    },
+    "wall_speedup": 1.045
+   },
+   "notes": "Staged attention loads, D fused into bwd, 16 bwd warps, max smem carveout. Attention now beats torch (8.9 vs 9.6). Training wall distorted: houssem on cuda:0 slowed 20 -> 25 s per 250 steps (slow card, see swapped run).",
+   "attn_bench_us": {
+    "shape": "B=64 H=8 L=64 DK=64 p=0.1",
+    "3156790 bwd 16 warps": {
+     "causal0": [
+      289.2,
+      332.8
+     ],
+     "causal1": [
+      174.3,
+      304.0
+     ]
+    },
+    "35525b2 bwd 8 qreg 0": {
+     "causal0": [
+      160.3,
+      299.8
+     ],
+     "causal1": [
+      155.8,
+      293.9
+     ]
+    },
+    "35525b2 bwd 8 qreg 1": {
+     "causal0": [
+      165.6,
+      294.8
+     ],
+     "causal1": [
+      164.6,
+      296.3
+     ]
+    },
+    "35525b2 bwd 16 qreg 0": {
+     "causal0": [
+      162.4,
+      279.4
+     ],
+     "causal1": [
+      154.8,
+      278.1
+     ]
+    },
+    "35525b2 bwd 16 qreg 1": {
+     "causal0": [
+      167.0,
+      279.9
+     ],
+     "causal1": [
+      162.5,
+      263.6
+     ]
+    },
+    "_format": "[attn_fwd us, attn_bwd us]; the first variant's 289 us fwd is likely warm-up"
+   }
+  },
+  {
+   "date": "2026-11-25",
+   "time_utc+1": "18:03",
+   "commit": "8abba38",
+   "branch": "gpu/attention-v3",
+   "gpus": {
+    "houssem_torch": "cuda:1",
+    "pytorch": "cuda:0"
+   },
+   "tests_on_t4": "47 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 42.9,
+     "torch.compile": 59.6,
+     "PyTorch eager": 71.3
+    },
+    "64": {
+     "houssem_torch": 78.1,
+     "torch.compile": 110.1,
+     "PyTorch eager": 129.3
+    },
+    "96": {
+     "houssem_torch": 112.0,
+     "torch.compile": 170.0,
+     "PyTorch eager": 197.1
+    }
+   },
+   "speedup_vs_compile_b64": 1.41,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 29.9
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.19,
+    "PyTorch eager": 2.69
+   },
+   "breakdown_ms_b64": {
+    "matrix multiplies": {
+     "houssem_torch": 48.6,
+     "torch.compile": 57.5,
+     "PyTorch eager": 53.1
+    },
+    "attention": {
+     "houssem_torch": 9.0,
+     "torch.compile": 10.9,
+     "PyTorch eager": 17.9
+    },
+    "LayerNorm + residual": {
+     "houssem_torch": 5.3,
+     "torch.compile": 11.9,
+     "PyTorch eager": 5.6
+    },
+    "activation, dropout, bias": {
+     "houssem_torch": 5.4,
+     "torch.compile": 13.7,
+     "PyTorch eager": 43.0
+    },
+    "loss": {
+     "houssem_torch": 1.1,
+     "torch.compile": 4.9,
+     "PyTorch eager": 0.0
+    },
+    "optimizer": {
+     "houssem_torch": 7.6,
+     "torch.compile": 10.7,
+     "PyTorch eager": 9.4
+    },
+    "embedding, other": {
+     "houssem_torch": 1.1,
+     "torch.compile": 0.4,
+     "PyTorch eager": 0.4
+    }
+   },
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 261,
+     "torch.compile": 348
+    },
+    "val_loss": {
+     "houssem_torch": 4.7757,
+     "torch.compile": 4.7884
+    },
+    "wall_speedup": 1.333
+   },
+   "notes": "Swapped-GPU check (QREG=0 default since f0e2cfb). houssem 77-78 ms on either card; torch.compile 95 (cuda:1) vs 110 (cuda:0): Kaggle cuda:0 is the slower card. The 1.41x here is inflated by the card; same-card ~1.22x."
+  },
+  {
+   "date": "2026-11-25",
+   "time_utc+1": "18:24",
+   "commit": "e82fad4",
+   "branch": "gpu/attention-v3",
+   "gpus": {
+    "houssem_torch": "cuda:1",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "48 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 46.4,
+     "torch.compile": 59.7,
+     "PyTorch eager": 72.1
+    },
+    "64": {
+     "houssem_torch": 87.7,
+     "torch.compile": 104.9,
+     "PyTorch eager": 130.9
+    },
+    "96": {
+     "houssem_torch": 123.4,
+     "torch.compile": 150.1,
+     "PyTorch eager": 181.9
+    }
+   },
+   "speedup_vs_compile_b64": 1.196,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 2.1
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.2,
+    "PyTorch eager": 2.68
+   },
+   "breakdown_ms_b64": {
+    "matrix multiplies": {
+     "houssem_torch": 56.3,
+     "torch.compile": 50.8,
+     "PyTorch eager": 48.4
+    },
+    "attention": {
+     "houssem_torch": 10.0,
+     "torch.compile": 10.6,
+     "PyTorch eager": 18.2
+    },
+    "LayerNorm + residual": {
+     "houssem_torch": 5.5,
+     "torch.compile": 12.5,
+     "PyTorch eager": 5.8
+    },
+    "activation, dropout, bias": {
+     "houssem_torch": 5.7,
+     "torch.compile": 13.2,
+     "PyTorch eager": 46.5
+    },
+    "loss": {
+     "houssem_torch": 1.1,
+     "torch.compile": 5.0,
+     "PyTorch eager": 0.0
+    },
+    "optimizer": {
+     "houssem_torch": 7.9,
+     "torch.compile": 12.4,
+     "PyTorch eager": 11.5
+    },
+    "embedding, other": {
+     "houssem_torch": 1.2,
+     "torch.compile": 0.4,
+     "PyTorch eager": 0.4
+    }
+   },
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 263,
+     "torch.compile": 317
+    },
+    "val_loss": {
+     "houssem_torch": 4.7753,
+     "torch.compile": 4.7964
+    },
+    "wall_speedup": 1.205
+   },
+   "notes": "Pinned async batch uploads. Both engines on cuda:1 (same card, sequential). Training 87.5 ms/step = step benchmark (loop overhead gone); host batch building 0.4 ms/step. Session ran slow: SM clock 975-1290 of 1590 MHz under load (power cap), so absolute times are ~12% higher; ratios valid. torch.compile setup 2.1 s = warm compile cache from earlier runs.",
+   "sm_clock_mhz_during_training": {
+    "houssem_torch": "975-1215",
+    "torch.compile": "1020-1290"
+   }
+  }
+ ]
+}
