@@ -21,7 +21,7 @@
 
 # %% Cell 1: settings
 REPO_URL = "https://github.com/HoussemBouzamoucha/houssem_torch.git"
-BRANCH = "gpu/driver-layer"
+BRANCH = "gpu/attention-v3"
 WORK = "/kaggle/working"
 REPO_DIR = f"{WORK}/houssem_torch"
 
