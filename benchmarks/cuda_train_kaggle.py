@@ -96,8 +96,10 @@ TORCH_GPU = int(os.environ.get("TORCH_GPU", 1 if N_GPUS > 1 else 0))
 def gpu_status(label):
     """Clocks, temperature, power and throttle reasons of every GPU."""
     print(f"-- GPU status {label}")
-    sh("nvidia-smi --query-gpu=index,clocks.sm,clocks.max.sm,temperature.gpu,"
-       "power.draw,clocks_throttle_reasons.active --format=csv")
+    # never fatal: the throttle-reasons field name varies by driver version
+    subprocess.run("nvidia-smi --query-gpu=index,clocks.sm,clocks.max.sm,"
+                   "temperature.gpu,power.draw,clocks_throttle_reasons.active "
+                   "--format=csv", shell=True)
 
 print(drv.device_info(HT_GPU))
 print("PyTorch", torch.__version__, "on cuda:%d" % TORCH_GPU)
