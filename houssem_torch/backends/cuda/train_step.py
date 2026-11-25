@@ -53,7 +53,7 @@ _ALIGN = 64          # parameter offsets, in elements (128 B in fp16)
 _LN_EPS = 1e-5       # houssem_torch.nn.LayerNorm default
 _ATT_WARPS = 4       # warps per fused-attention forward block
 _ATT_BWD_WARPS = 16  # warps per fused-attention backward block (T4: 16 > 8 > 4)
-_ATT_QREG = 1        # forward reads Q into registers (K, V only in shared)
+_ATT_QREG = 0        # 1: forward reads Q into registers (less smem; T4: ~5 us slower)
 _SMEM_LIMIT = 65536  # dynamic + static shared memory per block on sm_75
 _CE_THREADS = 512    # register-resident cross-entropy block size
 
