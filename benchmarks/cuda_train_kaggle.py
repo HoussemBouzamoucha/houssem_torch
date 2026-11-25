@@ -87,8 +87,18 @@ from houssem_torch.backends.cuda import driver as drv
 
 assert drv.is_available(), "CuPy cannot see a GPU: enable 'GPU T4 x2'"
 N_GPUS = torch.cuda.device_count()
-HT_GPU = 0
-TORCH_GPU = 1 if N_GPUS > 1 else 0      # one engine per T4 when there are two
+# One engine per T4 when there are two; HT_GPU=1 TORCH_GPU=0 swaps them to
+# rule out card-to-card differences (clocks, cooling).
+HT_GPU = int(os.environ.get("HT_GPU", 0))
+TORCH_GPU = int(os.environ.get("TORCH_GPU", 1 if N_GPUS > 1 else 0))
+
+
+def gpu_status(label):
+    """Clocks, temperature, power and throttle reasons of every GPU."""
+    print(f"-- GPU status {label}")
+    sh("nvidia-smi --query-gpu=index,clocks.sm,clocks.max.sm,temperature.gpu,"
+       "power.draw,clocks_throttle_reasons.active --format=csv")
+
 print(drv.device_info(HT_GPU))
 print("PyTorch", torch.__version__, "on cuda:%d" % TORCH_GPU)
 
@@ -468,7 +478,9 @@ def train_ht():
     return dict(log=log, wall=wall, val=val, state=state)
 
 
+gpu_status("before houssem_torch training")
 ht_run = train_ht()
+gpu_status("after houssem_torch training")
 print(f"houssem_torch: {TRAIN_STEPS} steps in {ht_run['wall']:.0f}s, "
       f"val loss {ht_run['val']:.4f}")
 
@@ -495,7 +507,9 @@ def train_torch(mode):
     return dict(log=log, wall=wall, val=val)
 
 
+gpu_status("before PyTorch training")
 torch_run = train_torch(TORCH_TRAIN_MODE)
+gpu_status("after PyTorch training")
 print(f"PyTorch {TORCH_TRAIN_MODE}: {TRAIN_STEPS} steps in {torch_run['wall']:.0f}s,"
       f" val loss {torch_run['val']:.4f}")
 
