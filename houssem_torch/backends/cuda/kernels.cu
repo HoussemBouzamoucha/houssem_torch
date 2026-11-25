@@ -718,28 +718,74 @@ __device__ __forceinline__ void ldsm_at(unsigned (*a)[2], const __half* p, int l
     }
 }
 
-// Load one head's rows [0, L) into shared dst[LP][LDS] (rows >= L zeroed),
-// adding the bias if given.
-__device__ __forceinline__ void load_head(__half* dst, const __half* src,
-                                          int stride, const __half* bias,
-                                          int b, int h, int L, int LP) {
-    for (int i = threadIdx.x; i < LP * (DK / 8); i += blockDim.x) {
-        int r = i / (DK / 8), c = (i % (DK / 8)) * 8;
-        float f[8];
-        if (r < L) {
-            load_vec<8>(src + (size_t)(b * L + r) * stride + h * DK + c, f);
-            if (bias) {
-                float bb[8];
-                load_vec<8>(bias + h * DK + c, bb);
+// Staged loads of one head's rows [0, L) (rows L..LP-1 zero) by NTHR
+// threads: fetch_head issues all of a thread's 16-byte global loads into
+// registers, put_head then adds the bias (if given, in fp32, rounded to
+// fp16) and writes them to shared dst[LP][LDS]. Fetching every matrix before
+// storing any keeps all of a block's loads in flight together (sm_75 has no
+// cp.async), instead of one load latency per loop iteration.
+static_assert(DK % 8 == 0 && (DK / 8 & (DK / 8 - 1)) == 0 && DK / 8 <= 32,
+              "DK / 8 must be a power of two <= 32");
+
+template <int LP, int NTHR>
+struct Stage {
+    static constexpr int N = LP * (DK / 8), PER = (N + NTHR - 1) / NTHR;
+    uint4 v[PER];
+};
+
+template <int L, int LP, int NTHR>
+__device__ __forceinline__ void fetch_head(Stage<LP, NTHR>& s, const __half* src,
+                                           int stride, int b, int h) {
 #pragma unroll
-                for (int e = 0; e < 8; ++e) f[e] += bb[e];
-            }
-        } else {
-#pragma unroll
-            for (int e = 0; e < 8; ++e) f[e] = 0.f;
-        }
-        store_vec<8>(dst + r * LDS + c, f);
+    for (int u = 0; u < s.PER; ++u) {
+        int i = threadIdx.x + u * NTHR, r = i / (DK / 8), c = (i % (DK / 8)) * 8;
+        s.v[u] = make_uint4(0u, 0u, 0u, 0u);
+        if (i < s.N && r < L)
+            s.v[u] = __ldg(reinterpret_cast<const uint4*>(
+                src + (size_t)(b * L + r) * stride + h * DK + c));
     }
+}
+
+__device__ __forceinline__ __half2 add_bias2(__half2 x, const __half* bias) {
+    float2 a = __half22float2(x);
+    float2 c = __half22float2(*reinterpret_cast<const __half2*>(bias));
+    return __floats2half2_rn(a.x + c.x, a.y + c.y);
+}
+
+template <int L, int LP, int NTHR>
+__device__ __forceinline__ void put_head(__half* dst, const Stage<LP, NTHR>& s,
+                                         const __half* bias, int h) {
+#pragma unroll
+    for (int u = 0; u < s.PER; ++u) {
+        int i = threadIdx.x + u * NTHR, r = i / (DK / 8), c = (i % (DK / 8)) * 8;
+        if (i >= s.N) continue;
+        uint4 x = s.v[u];
+        if (bias && r < L) {
+            __half2* hx = reinterpret_cast<__half2*>(&x);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) hx[e] = add_bias2(hx[e], bias + h * DK + c + 2 * e);
+        }
+        *reinterpret_cast<uint4*>(dst + r * LDS + c) = x;
+    }
+}
+
+// A fragments of query rows m0..m0+15 straight from global memory (rows >=
+// AQ zero), with the bias added: what ldsm_a gives from a shared copy.
+__device__ __forceinline__ void q_frags(unsigned (*qa)[2], const __half* q, int qs,
+                                        const __half* qb, int b, int h, int m0,
+                                        int g, int t) {
+#pragma unroll
+    for (int kk = 0; kk < NT_D; ++kk)
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            int r = m0 + g + 8 * hf, c = h * DK + 8 * kk + 2 * t;
+            __half2 x = __floats2half2_rn(0.f, 0.f);
+            if (r < AQ) {
+                x = __ldg(reinterpret_cast<const __half2*>(q + (size_t)(b * AQ + r) * qs + c));
+                if (qb) x = add_bias2(x, qb + c);
+            }
+            qa[kk][hf] = *reinterpret_cast<unsigned*>(&x);
+        }
 }
 
 // key_state: 0 = visible, 1 = padding (MASK_VALUE), 2 = beyond AK (-inf)
@@ -773,28 +819,55 @@ __device__ __forceinline__ void tile_score(float* s, const unsigned (*qa)[2],
     }
 }
 
-extern "C" __global__ void attn_fwd(
+// QREG: each warp reads its query rows from global memory straight into
+// A fragments, so only K and V take shared memory (more blocks per SM).
+#ifndef QREG
+#define QREG 1
+#endif
+
+extern "C" __global__ void __launch_bounds__(NW * 32) attn_fwd(
         const __half* __restrict__ q, int qs, const __half* __restrict__ qb,
         const __half* __restrict__ k, int ks, const __half* __restrict__ kb,
         const __half* __restrict__ v, int vs, const __half* __restrict__ vb,
         const int* __restrict__ kid, __half* __restrict__ out, int os,
         float* __restrict__ lse, int H, int pad_id, unsigned seed, float p,
         float alpha) {
+    constexpr int NTHR = NW * 32;
     extern __shared__ __align__(16) unsigned char smem[];
+#if QREG
+    __half* sK = reinterpret_cast<__half*>(smem);
+#else
     __half* sQ = reinterpret_cast<__half*>(smem);
     __half* sK = sQ + AQP * LDS;
+#endif
     __half* sV = sK + AKP * LDS;
     __shared__ int kst[AKP];
     int bh = blockIdx.x, b = bh / H, h = bh % H;
-    load_head(sQ, q, qs, qb, b, h, AQ, AQP);
-    load_head(sK, k, ks, kb, b, h, AK, AKP);
-    load_head(sV, v, vs, vb, b, h, AK, AKP);
-    load_key_state(kst, kid, b, pad_id);
-    __syncthreads();
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    Stage<AKP, NTHR> stK, stV;
+    fetch_head<AK, AKP, NTHR>(stK, k, ks, b, h);
+    fetch_head<AK, AKP, NTHR>(stV, v, vs, b, h);
+#if QREG
+    unsigned qa[NT_D][2];
+    if (warp * 16 < AQP) q_frags(qa, q, qs, qb, b, h, warp * 16, g, t);
+#else
+    Stage<AQP, NTHR> stQ;
+    fetch_head<AQ, AQP, NTHR>(stQ, q, qs, b, h);
+#endif
+    load_key_state(kst, kid, b, pad_id);
+    put_head<AK, AKP, NTHR>(sK, stK, kb, h);
+    put_head<AK, AKP, NTHR>(sV, stV, vb, h);
+#if !QREG
+    put_head<AQ, AQP, NTHR>(sQ, stQ, qb, h);
+#endif
+    __syncthreads();
     for (int m0 = warp * 16; m0 < AQP; m0 += NW * 16) {
+#if QREG
+        if (m0 != warp * 16) q_frags(qa, q, qs, qb, b, h, m0, g, t);
+#else
         unsigned qa[NT_D][2];
         ldsm_a<NT_D>(qa, sQ + m0 * LDS, LDS);
+#endif
         float s[NT_K][4];
 #pragma unroll
         for (int j = 0; j < NT_K; ++j) tile_score(s[j], qa, sK, kst, j, m0, g, t, alpha);
@@ -924,7 +997,7 @@ constexpr int att_ksplit(int want) {
 //            dS and dropout(P) go to shared memory.
 //   phase 2, warps own (query tile, head-dim slice): dQ = a*dS K, and
 //            (key tile, head-dim slice): dV = Pd^T dO, dK = a*dS^T Q.
-extern "C" __global__ void attn_bwd(
+extern "C" __global__ void __launch_bounds__(NWB * 32) attn_bwd(
         const __half* __restrict__ q, int qs, const __half* __restrict__ qb,
         const __half* __restrict__ k, int ks, const __half* __restrict__ kb,
         const __half* __restrict__ v, int vs, const __half* __restrict__ vb,
@@ -950,30 +1023,41 @@ extern "C" __global__ void attn_bwd(
     __shared__ int kst[AKP];
     __shared__ float sD[AQP];
     __shared__ float s_bias[3][DK];
+    constexpr int NTHR = NWB * 32;
     int bh = blockIdx.x, b = bh / H, h = bh % H;
-    load_head(sQ, q, qs, qb, b, h, AQ, AQP);
-    load_head(sK, k, ks, kb, b, h, AK, AKP);
-    load_head(sV, v, vs, vb, b, h, AK, AKP);
-    load_head(sdO, dout, dos, nullptr, b, h, AQ, AQP);
+    Stage<AQP, NTHR> stQ, stdO, stO;
+    Stage<AKP, NTHR> stK, stV;
+    fetch_head<AQ, AQP, NTHR>(stQ, q, qs, b, h);
+    fetch_head<AK, AKP, NTHR>(stK, k, ks, b, h);
+    fetch_head<AK, AKP, NTHR>(stV, v, vs, b, h);
+    fetch_head<AQ, AQP, NTHR>(stdO, dout, dos, b, h);
+    fetch_head<AQ, AQP, NTHR>(stO, o, os, b, h);
     load_key_state(kst, kid, b, pad_id);
     for (int i = threadIdx.x; i < 3 * DK; i += blockDim.x) (&s_bias[0][0])[i] = 0.f;
-    __syncthreads();
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    // D[r] = dO[r] * O[r] (dO from shared, rounded to fp16 like O)
-    for (int r = warp; r < AQP; r += NWB) {
+    put_head<AQ, AQP, NTHR>(sQ, stQ, qb, h);
+    put_head<AK, AKP, NTHR>(sK, stK, kb, h);
+    put_head<AK, AKP, NTHR>(sV, stV, vb, h);
+    put_head<AQ, AQP, NTHR>(sdO, stdO, nullptr, h);
+    // D[r] = dO[r] . O[r] from the staged registers: the DK / 8 threads of a
+    // row are adjacent lanes (rows >= AQ hold zeros, so D = 0 there).
+#pragma unroll
+    for (int u = 0; u < stO.PER; ++u) {
+        int i = threadIdx.x + u * NTHR;
+        const __half2* ho = reinterpret_cast<const __half2*>(&stO.v[u]);
+        const __half2* hd = reinterpret_cast<const __half2*>(&stdO.v[u]);
         float acc = 0.f;
-        if (r < AQ)
-            for (int c = 2 * lane; c < DK; c += 64) {
-                float2 of = __half22float2(*reinterpret_cast<const __half2*>(
-                    o + (size_t)(b * AQ + r) * os + h * DK + c));
-                float2 df = __half22float2(*reinterpret_cast<const __half2*>(
-                    sdO + r * LDS + c));
-                acc += of.x * df.x + of.y * df.y;
-            }
-        acc = warp_sum(acc);
-        if (lane == 0) sD[r] = acc;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float2 of = __half22float2(ho[e]), df = __half22float2(hd[e]);
+            acc += of.x * df.x + of.y * df.y;
+        }
+#pragma unroll
+        for (int off = 1; off < DK / 8; off <<= 1)
+            acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        if (i < stO.N && i % (DK / 8) == 0) sD[i / (DK / 8)] = acc;
     }
     __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
 
     // ---- phase 1: dS and dropout(P), (query tile, key tiles ks, ks+KS, ...)
     for (int it = warp; it < QT * KS; it += NWB) {

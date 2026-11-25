@@ -402,8 +402,11 @@ class Kernel:
 
     def set_max_dynamic_shared(self, nbytes: int) -> None:
         """Allow launches with up to `nbytes` of dynamic shared memory
-        (above 48 KB needs this opt-in; sm_75 allows up to 64 KB)."""
+        (above 48 KB needs this opt-in; sm_75 allows up to 64 KB), and ask
+        for the largest shared-memory carveout so as many blocks as the
+        shared memory allows can share an SM."""
         self._fn.max_dynamic_shared_size_bytes = int(nbytes)
+        self._fn.preferred_shared_memory_carveout = 100
 
     @property
     def max_threads_per_block(self) -> int:

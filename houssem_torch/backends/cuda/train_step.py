@@ -52,7 +52,8 @@ _THREADS = 256
 _ALIGN = 64          # parameter offsets, in elements (128 B in fp16)
 _LN_EPS = 1e-5       # houssem_torch.nn.LayerNorm default
 _ATT_WARPS = 4       # warps per fused-attention forward block
-_ATT_BWD_WARPS = 8   # warps per fused-attention backward block
+_ATT_BWD_WARPS = 16  # warps per fused-attention backward block (T4: 16 > 8 > 4)
+_ATT_QREG = 1        # forward reads Q into registers (K, V only in shared)
 _SMEM_LIMIT = 65536  # dynamic + static shared memory per block on sm_75
 _CE_THREADS = 512    # register-resident cross-entropy block size
 
@@ -69,12 +70,12 @@ def _pad16(n):
     return -(-n // 16) * 16
 
 
-def attn_smem(lq, lk, dk):
+def attn_smem(lq, lk, dk, qreg=_ATT_QREG):
     """(forward, backward) dynamic shared bytes of the fused attention
     kernels, and the backward's static shared bytes."""
     qp, kp = _pad16(lq), _pad16(lk)
     lds, ldp = dk + 8, kp + 8
-    fwd = 2 * (qp + 2 * kp) * lds
+    fwd = 2 * ((0 if qreg else qp) + 2 * kp) * lds
     bwd = 2 * ((2 * qp + 2 * kp) * lds + 2 * qp * ldp)
     static = 4 * kp + 4 * qp + 12 * dk
     return fwd, bwd, static
@@ -233,7 +234,7 @@ class TrainStep:
                 fwd_smem, bwd_smem = fused
                 defs = dict(ATT=1, AQ=lq, AK=lk, AQP=_pad16(lq), AKP=_pad16(lk),
                             DK=self.dk, CAUSAL=causal, NW=_ATT_WARPS,
-                            NWB=_ATT_BWD_WARPS)
+                            NWB=_ATT_BWD_WARPS, QREG=_ATT_QREG)
                 kf = self._kernel("attn_fwd", **defs)
                 kb = self._kernel("attn_bwd", **defs)
                 kf.set_max_dynamic_shared(fwd_smem)

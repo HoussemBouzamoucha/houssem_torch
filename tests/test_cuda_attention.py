@@ -92,9 +92,13 @@ CASES = {
 }
 
 
-@pytest.mark.parametrize("nwb", sorted({4, _ATT_BWD_WARPS, 16}))
+# (backward warps, forward Q in registers)
+VARIANTS = sorted({(4, 1), (8, 1), (16, 1), (_ATT_BWD_WARPS, 0)})
+
+
+@pytest.mark.parametrize("nwb,qreg", VARIANTS)
 @pytest.mark.parametrize("case", CASES)
-def test_fused_attention_matches_reference(case, nwb):
+def test_fused_attention_matches_reference(case, nwb, qreg):
     B, H, LQ, LK, DK, causal, p, with_bias = CASES[case]
     d = H * DK
     rng = np.random.default_rng(0)
@@ -125,10 +129,10 @@ def test_fused_attention_matches_reference(case, nwb):
         heads(dout.astype(np.float64), B, LQ, H, DK), alpha)
 
     defs = dict(USE_HALF=1, ATT=1, AQ=LQ, AK=LK, AQP=_pad16(LQ), AKP=_pad16(LK),
-                DK=DK, CAUSAL=causal, NW=_ATT_WARPS, NWB=nwb)
+                DK=DK, CAUSAL=causal, NW=_ATT_WARPS, NWB=nwb, QREG=qreg)
     kf_, kb_ = (driver.compile_kernel(_SOURCE, n, defs)
                 for n in ("attn_fwd", "attn_bwd"))
-    fwd_smem, bwd_smem, _ = attn_smem(LQ, LK, DK)
+    fwd_smem, bwd_smem, _ = attn_smem(LQ, LK, DK, qreg)
     kf_.set_max_dynamic_shared(fwd_smem)
     kb_.set_max_dynamic_shared(bwd_smem)
 
