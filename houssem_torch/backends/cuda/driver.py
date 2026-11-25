@@ -154,6 +154,16 @@ class Buffer:
                              f"host {host.shape}")
         self._arr.set(host)
 
+    def copy_from_async(self, host: np.ndarray) -> None:
+        """Queue an upload of a pinned host array (see `pinned_empty`) of the
+        same shape and dtype on the current stream, without waiting for
+        earlier GPU work. The host array must not change until the copy has
+        run (record an `Event` after it and wait on that before reuse)."""
+        if host.shape != self.shape or host.dtype != self.dtype:
+            raise ValueError(f"copy_from_async mismatch: {self.shape}/"
+                             f"{self.dtype} vs {host.shape}/{host.dtype}")
+        self._arr.set(host, stream=_cp.cuda.get_current_stream())
+
     def copy_(self, other: "Buffer") -> None:
         """Device-to-device copy from a buffer of the same shape and dtype."""
         if other.shape != self.shape or other.dtype != self.dtype:
@@ -206,6 +216,33 @@ def from_numpy(host: np.ndarray, dtype=None) -> Buffer:
     _require()
     dt = _check_dtype(host.dtype if dtype is None else dtype)
     return Buffer(_cp.asarray(np.ascontiguousarray(host, dtype=dt)))
+
+
+def pinned_empty(shape, dtype=np.float32) -> np.ndarray:
+    """A NumPy array in page-locked host memory: uploads from it can run
+    asynchronously (from ordinary pageable memory, CUDA first waits for all
+    earlier work on the stream)."""
+    _require()
+    dtype = _check_dtype(dtype)
+    shape = tuple(int(n) for n in (shape if isinstance(shape, tuple) else (shape,)))
+    count = int(np.prod(shape, dtype=np.int64))
+    mem = _cp.cuda.alloc_pinned_memory(max(count, 1) * dtype.itemsize)
+    return np.frombuffer(mem, dtype, count).reshape(shape)  # keeps mem alive
+
+
+class Event:
+    """A marker in the current stream's queue of work."""
+
+    def __init__(self):
+        _require()
+        self._e = _cp.cuda.Event(disable_timing=True)
+
+    def record(self) -> None:
+        self._e.record()
+
+    def synchronize(self) -> None:
+        """Wait (on the host) until the GPU has passed the marker."""
+        self._e.synchronize()
 
 
 def memory_in_use() -> int:
@@ -402,8 +439,11 @@ class Kernel:
 
     def set_max_dynamic_shared(self, nbytes: int) -> None:
         """Allow launches with up to `nbytes` of dynamic shared memory
-        (above 48 KB needs this opt-in; sm_75 allows up to 64 KB)."""
+        (above 48 KB needs this opt-in; sm_75 allows up to 64 KB), and ask
+        for the largest shared-memory carveout so as many blocks as the
+        shared memory allows can share an SM."""
         self._fn.max_dynamic_shared_size_bytes = int(nbytes)
+        self._fn.preferred_shared_memory_carveout = 100
 
     @property
     def max_threads_per_block(self) -> int:

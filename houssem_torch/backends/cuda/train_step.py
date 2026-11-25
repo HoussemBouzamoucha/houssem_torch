@@ -51,7 +51,9 @@ _SOURCE = Path(__file__).with_name("kernels.cu").read_text(encoding="utf-8")
 _THREADS = 256
 _ALIGN = 64          # parameter offsets, in elements (128 B in fp16)
 _LN_EPS = 1e-5       # houssem_torch.nn.LayerNorm default
-_ATT_WARPS = 4       # warps per fused-attention block
+_ATT_WARPS = 4       # warps per fused-attention forward block
+_ATT_BWD_WARPS = 16  # warps per fused-attention backward block (T4: 16 > 8 > 4)
+_ATT_QREG = 0        # 1: forward reads Q into registers (less smem; T4: ~5 us slower)
 _SMEM_LIMIT = 65536  # dynamic + static shared memory per block on sm_75
 _CE_THREADS = 512    # register-resident cross-entropy block size
 
@@ -66,6 +68,17 @@ def _vec_width(n, half, limit=None):
 
 def _pad16(n):
     return -(-n // 16) * 16
+
+
+def attn_smem(lq, lk, dk, qreg=_ATT_QREG):
+    """(forward, backward) dynamic shared bytes of the fused attention
+    kernels, and the backward's static shared bytes."""
+    qp, kp = _pad16(lq), _pad16(lk)
+    lds, ldp = dk + 8, kp + 8
+    fwd = 2 * ((0 if qreg else qp) + 2 * kp) * lds
+    bwd = 2 * ((2 * qp + 2 * kp) * lds + 2 * qp * ldp)
+    static = 4 * kp + 4 * qp + 12 * dk
+    return fwd, bwd, static
 
 
 @dataclass
@@ -220,7 +233,8 @@ class TrainStep:
             if fused is not None:
                 fwd_smem, bwd_smem = fused
                 defs = dict(ATT=1, AQ=lq, AK=lk, AQP=_pad16(lq), AKP=_pad16(lk),
-                            DK=self.dk, CAUSAL=causal, NW=_ATT_WARPS)
+                            DK=self.dk, CAUSAL=causal, NW=_ATT_WARPS,
+                            NWB=_ATT_BWD_WARPS, QREG=_ATT_QREG)
                 kf = self._kernel("attn_fwd", **defs)
                 kb = self._kernel("attn_bwd", **defs)
                 kf.set_max_dynamic_shared(fwd_smem)
@@ -249,11 +263,7 @@ class TrainStep:
         kernels for this shape, or None if they don't apply."""
         if not (self.fused_attention and self.half and self.dk % 8 == 0):
             return None
-        qp, kp, dk = _pad16(lq), _pad16(lk), self.dk
-        lds, ldp = dk + 8, kp + 8
-        fwd = 2 * (qp + 2 * kp) * lds
-        bwd = 2 * ((2 * qp + 2 * kp) * lds + 2 * qp * ldp)
-        static = 4 * kp + 4 * qp + 12 * dk
+        fwd, bwd, static = attn_smem(lq, lk, self.dk)
         if bwd + static > _SMEM_LIMIT:
             return None
         return fwd, bwd
@@ -280,6 +290,17 @@ class TrainStep:
         self.src_ids = drv.zeros((B, self.S), np.int32)
         self.tgt_in_ids = drv.zeros((B, self.T), np.int32)
         self.tgt_out_ids = drv.zeros((B, self.T), np.int32)
+        # Two pinned host slots for the ids: a batch's upload is queued
+        # behind the previous step without the host waiting for the GPU (an
+        # upload from pageable memory would wait), so the next step's
+        # launches overlap the current step. A slot is refilled only after
+        # the GPU has consumed its last upload.
+        self._stage = [tuple(drv.pinned_empty(b.shape, np.int32) for b in
+                             (self.src_ids, self.tgt_in_ids, self.tgt_out_ids))
+                       for _ in range(2)]
+        self._stage_done = [drv.Event(), drv.Event()]
+        self._stage_used = [False, False]
+        self._slot = 0
         self.pe = drv.from_numpy(sinusoidal_position_encoding(cfg.max_len, d))
         ones = np.ones(B * max(self.S, self.T), self.dtype)
         self.ones = drv.from_numpy(ones)
@@ -554,7 +575,7 @@ class TrainStep:
             out_args += [drv.ptr(buf, off), stride]
         bias_args = [drv.ptr(b, off) if b is not None else None for b, off in gbias]
         _, kb, _, bwd_smem = fused
-        kb(self.B * self.H, _ATT_WARPS * 32, *self._qkv_parts(sub), kid,
+        kb(self.B * self.H, _ATT_BWD_WARPS * 32, *self._qkv_parts(sub), kid,
            ctx, d, g_ctx, d, sub.bufs["lse"], *out_args, *bias_args,
            self.H, self.cfg.pad_id, self._seed(sub.inner_seed), self._p_attn,
            1.0 / math.sqrt(self.dk), shared_mem=bwd_smem)
@@ -723,9 +744,17 @@ class TrainStep:
             if a.shape != want[name]:
                 raise ValueError(f"{name} must have shape {want[name]} (the "
                                  f"shape this step was built for), got {a.shape}")
-        self.src_ids.copy_from(src)
-        self.tgt_in_ids.copy_from(tgt_in)
-        self.tgt_out_ids.copy_from(tgt_out)
+        slot = self._slot
+        self._slot ^= 1
+        if self._stage_used[slot]:
+            self._stage_done[slot].synchronize()
+        host = self._stage[slot]
+        for h, a, buf in zip(host, (src, tgt_in, tgt_out),
+                             (self.src_ids, self.tgt_in_ids, self.tgt_out_ids)):
+            h[...] = a
+            buf.copy_from_async(h)
+        self._stage_done[slot].record()
+        self._stage_used[slot] = True
         self._count = max(int((tgt_out != self.cfg.pad_id).sum()), 1)
 
     def forward_backward(self, src, tgt_in, tgt_out, train: bool = True) -> None:

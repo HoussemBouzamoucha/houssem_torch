@@ -21,7 +21,7 @@
 
 # %% Cell 1: settings
 REPO_URL = "https://github.com/HoussemBouzamoucha/houssem_torch.git"
-BRANCH = "gpu/driver-layer"
+BRANCH = "gpu/attention-v3"
 WORK = "/kaggle/working"
 REPO_DIR = f"{WORK}/houssem_torch"
 
@@ -87,8 +87,20 @@ from houssem_torch.backends.cuda import driver as drv
 
 assert drv.is_available(), "CuPy cannot see a GPU: enable 'GPU T4 x2'"
 N_GPUS = torch.cuda.device_count()
-HT_GPU = 0
-TORCH_GPU = 1 if N_GPUS > 1 else 0      # one engine per T4 when there are two
+# One engine per T4 when there are two; HT_GPU=1 TORCH_GPU=0 swaps them to
+# rule out card-to-card differences (clocks, cooling).
+HT_GPU = int(os.environ.get("HT_GPU", 0))
+TORCH_GPU = int(os.environ.get("TORCH_GPU", 1 if N_GPUS > 1 else 0))
+
+
+def gpu_status(label):
+    """Clocks, temperature, power and throttle reasons of every GPU."""
+    print(f"-- GPU status {label}")
+    # never fatal: the throttle-reasons field name varies by driver version
+    subprocess.run("nvidia-smi --query-gpu=index,clocks.sm,clocks.max.sm,"
+                   "temperature.gpu,power.draw,clocks_throttle_reasons.active "
+                   "--format=csv", shell=True)
+
 print(drv.device_info(HT_GPU))
 print("PyTorch", torch.__version__, "on cuda:%d" % TORCH_GPU)
 
@@ -168,6 +180,31 @@ def batches(data, epoch_seed, B=BATCH):
     idx = np.random.default_rng(epoch_seed).permutation(len(data))
     for i in range(0, len(idx) - B + 1, B):
         yield to_batch([data[j] for j in idx[i:i + B]])
+
+
+class Timed:
+    """Iterator wrapper adding up the host time spent producing items."""
+
+    def __init__(self, it):
+        self.it, self.s = iter(it), 0.0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        t = time.perf_counter()
+        try:
+            return next(self.it)
+        finally:
+            self.s += time.perf_counter() - t
+
+
+def sm_clock(idx):
+    """Current SM clock of GPU idx, e.g. '1590 MHz' ('?' if unavailable)."""
+    r = subprocess.run(f"nvidia-smi -i {idx} --query-gpu=clocks.sm "
+                       "--format=csv,noheader", shell=True,
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "?"
 
 
 def train_stream(n_steps):
@@ -451,12 +488,14 @@ def val_loss_ht(step):
 def train_ht():
     step, _ = build_ht()
     log, t0 = [], time.perf_counter()
-    for i, b in enumerate(train_stream(TRAIN_STEPS), start=1):
+    stream = Timed(train_stream(TRAIN_STEPS))
+    for i, b in enumerate(stream, start=1):
         step(*b, lr=noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
             loss, el = step.last_loss(), time.perf_counter() - t0
             log.append((i, loss, el))
             print(f"[houssem] step {i:6d}  loss {loss:.4f}  {el:7.1f}s  "
+                  f"data {stream.s:5.1f}s  {sm_clock(HT_GPU)}  "
                   f"scale {step.stats()['loss_scale']:.0f}", flush=True)
     drv.synchronize()
     wall = time.perf_counter() - t0
@@ -468,7 +507,9 @@ def train_ht():
     return dict(log=log, wall=wall, val=val, state=state)
 
 
+gpu_status("before houssem_torch training")
 ht_run = train_ht()
+gpu_status("after houssem_torch training")
 print(f"houssem_torch: {TRAIN_STEPS} steps in {ht_run['wall']:.0f}s, "
       f"val loss {ht_run['val']:.4f}")
 
@@ -477,13 +518,15 @@ def train_torch(mode):
     model, opt, scaler = build_torch(init_state)
     step = torch_step_fn(model, opt, scaler, mode)
     log, t0 = [], time.perf_counter()
-    for i, b in enumerate(train_stream(TRAIN_STEPS), start=1):
+    stream = Timed(train_stream(TRAIN_STEPS))
+    for i, b in enumerate(stream, start=1):
         loss = step(to_torch(b), noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
             el, lv = time.perf_counter() - t0, loss.detach().item()
             log.append((i, lv, el))
             print(f"[torch {mode}] step {i:6d}  loss {lv:.4f}  "
-                  f"{el:7.1f}s", flush=True)
+                  f"{el:7.1f}s  data {stream.s:5.1f}s  "
+                  f"{sm_clock(TORCH_GPU)}", flush=True)
     torch.cuda.synchronize(torch_dev)
     wall = time.perf_counter() - t0
     model.eval()
@@ -495,7 +538,9 @@ def train_torch(mode):
     return dict(log=log, wall=wall, val=val)
 
 
+gpu_status("before PyTorch training")
 torch_run = train_torch(TORCH_TRAIN_MODE)
+gpu_status("after PyTorch training")
 print(f"PyTorch {TORCH_TRAIN_MODE}: {TRAIN_STEPS} steps in {torch_run['wall']:.0f}s,"
       f" val loss {torch_run['val']:.4f}")
 

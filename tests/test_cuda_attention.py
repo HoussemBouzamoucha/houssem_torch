@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(not driver.is_available(),
                                 reason="needs CuPy and a CUDA GPU")
 
 from houssem_torch.backends.cuda.train_step import (  # noqa: E402
-    _SOURCE, _pad16)
+    _SOURCE, _ATT_BWD_WARPS, _ATT_WARPS, _pad16, attn_smem)
 
 MASK_VALUE = -1e9
 PAD = 0
@@ -92,8 +92,13 @@ CASES = {
 }
 
 
+# (backward warps, forward Q in registers)
+VARIANTS = sorted({(4, 1), (8, 1), (16, 1), (_ATT_BWD_WARPS, 0)})
+
+
+@pytest.mark.parametrize("nwb,qreg", VARIANTS)
 @pytest.mark.parametrize("case", CASES)
-def test_fused_attention_matches_reference(case):
+def test_fused_attention_matches_reference(case, nwb, qreg):
     B, H, LQ, LK, DK, causal, p, with_bias = CASES[case]
     d = H * DK
     rng = np.random.default_rng(0)
@@ -124,12 +129,10 @@ def test_fused_attention_matches_reference(case):
         heads(dout.astype(np.float64), B, LQ, H, DK), alpha)
 
     defs = dict(USE_HALF=1, ATT=1, AQ=LQ, AK=LK, AQP=_pad16(LQ), AKP=_pad16(LK),
-                DK=DK, CAUSAL=causal, NW=4)
+                DK=DK, CAUSAL=causal, NW=_ATT_WARPS, NWB=nwb, QREG=qreg)
     kf_, kb_ = (driver.compile_kernel(_SOURCE, n, defs)
                 for n in ("attn_fwd", "attn_bwd"))
-    qp, kp, lds, ldp = _pad16(LQ), _pad16(LK), DK + 8, _pad16(LK) + 8
-    fwd_smem = 2 * (qp + 2 * kp) * lds
-    bwd_smem = 2 * ((2 * qp + 2 * kp) * lds + 2 * qp * ldp)
+    fwd_smem, bwd_smem, _ = attn_smem(LQ, LK, DK, qreg)
     kf_.set_max_dynamic_shared(fwd_smem)
     kb_.set_max_dynamic_shared(bwd_smem)
 
@@ -143,8 +146,8 @@ def test_fused_attention_matches_reference(case):
     qkv_args = [ptr(gq), d, ptr(gbq) if gbq else None,
                 ptr(gkv), 2 * d, ptr(gbkv) if gbkv else None,
                 ptr(gkv, d), 2 * d, ptr(gbkv, d) if gbkv else None]
-    kf_(B * H, 128, *qkv_args, gkid, out, d, glse, H, PAD, np.uint32(seed), p,
-        alpha, shared_mem=fwd_smem)
+    kf_(B * H, 32 * _ATT_WARPS, *qkv_args, gkid, out, d, glse, H, PAD,
+        np.uint32(seed), p, alpha, shared_mem=fwd_smem)
     np.testing.assert_allclose(out.numpy().astype(np.float64), merged(o),
                                atol=2e-2, rtol=2e-2)
     stats = glse.numpy().astype(np.float64).reshape(B, H, LQ, 2)
@@ -155,7 +158,7 @@ def test_fused_attention_matches_reference(case):
     dkv_b = driver.zeros((B * LK, 2 * d), np.float16)
     dbq = driver.zeros(d) if with_bias else None
     dbkv = driver.zeros(2 * d) if with_bias else None
-    kb_(B * H, 128, *qkv_args, gkid, out, d, gdout, d, glse,
+    kb_(B * H, 32 * nwb, *qkv_args, gkid, out, d, gdout, d, glse,
         ptr(dq_b), d, ptr(dkv_b), 2 * d, ptr(dkv_b, d), 2 * d,
         ptr(dbq) if dbq else None, ptr(dbkv) if dbkv else None,
         ptr(dbkv, d) if dbkv else None,
