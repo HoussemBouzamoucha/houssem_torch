@@ -8,6 +8,7 @@ Everything the GPU engine needs from the hardware goes through here:
                     run's sizes baked in as compile-time constants
     gemm            cuBLAS matrix multiply (row-major, fp32 or fp16)
     gemm_batched    cuBLAS strided batched multiply (one per attention head)
+    gemm_tuning     pick the fastest cuBLAS algorithm per multiply shape
 
 CuPy is used only as a set of bindings (memory pool, streams, NVRTC,
 cuBLAS handle). No CuPy type is returned from this module, so the rest of
@@ -532,6 +533,101 @@ def _handle():
     return h
 
 
+# ---------------------------------------------------------------------------
+# cuBLAS algorithm choice per multiply shape, decided at startup
+# ---------------------------------------------------------------------------
+# cuBLAS's default heuristic is not always the fastest kernel for a given
+# shape. Inside `gemm_tuning()`, the first multiply of each new shape times
+# every candidate algorithm (on a scratch output, so results are untouched)
+# and keeps the fastest; afterwards every multiply of that shape uses it.
+# On Turing (sm_75) cuBLAS honours the explicit ALGO0..15_TENSOR_OP choices
+# (newer GPUs ignore them and use the default, so tuning changes nothing).
+
+_GEMM_CANDIDATES = (_CUBLAS_GEMM_DEFAULT_TENSOR_OP,) + tuple(range(100, 116))
+_GEMM_ALGO: dict[tuple, int] = {}       # shape key -> chosen algorithm
+_GEMM_LABEL: dict[tuple, str] = {}      # shape key -> readable label
+_GEMM_TIMES: dict[tuple, dict] = {}     # shape key -> {algo: µs}, for reports
+_TUNING = 0
+_TUNE_REPS = 5
+_TUNE_MARGIN = 0.97     # a candidate must beat the default by 3% to replace it
+
+
+class gemm_tuning:
+    """Choose cuBLAS algorithms for the multiplies run inside this block.
+
+        with driver.gemm_tuning():
+            step.forward_backward(...)    # one pass: every shape gets tuned
+
+    Each multiply shape is tuned once per process (choices are shared by
+    every caller); the block waits for the GPU while it times candidates.
+    """
+
+    def __enter__(self):
+        global _TUNING
+        _TUNING += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _TUNING
+        _TUNING -= 1
+
+
+def gemm_algorithms() -> dict[str, dict]:
+    """The tuned shapes: {label: {"algo": chosen, "us": {algo: µs}}}.
+    The label is the profiler's shape label plus dtypes and beta."""
+    return {_GEMM_LABEL[k]: {"algo": a, "us": dict(_GEMM_TIMES.get(k, {}))}
+            for k, a in _GEMM_ALGO.items()}
+
+
+def reset_gemm_algorithms() -> None:
+    """Forget every tuned choice (multiplies go back to cuBLAS's default)."""
+    _GEMM_ALGO.clear()
+    _GEMM_LABEL.clear()
+    _GEMM_TIMES.clear()
+
+
+def _gemm_algo(key, label, run, c):
+    """The algorithm for this multiply shape; tunes it first when inside
+    `gemm_tuning()` and the shape is new. `run(algo, c)` queues the multiply
+    into output buffer c."""
+    algo = _GEMM_ALGO.get(key)
+    if algo is not None:
+        return algo
+    if not _TUNING:
+        return _CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    scratch = Buffer(_cp.empty_like(c._arr))
+    start, end = _cp.cuda.Event(), _cp.cuda.Event()
+
+    def time_us(a):
+        try:
+            run(a, scratch)                   # warm-up; unsupported -> error
+        except Exception:  # noqa: BLE001  (cuBLAS: algorithm not supported)
+            return float("inf")
+        start.record()
+        for _ in range(_TUNE_REPS):
+            run(a, scratch)
+        end.record()
+        end.synchronize()
+        return _cp.cuda.get_elapsed_time(start, end) * 1e3 / _TUNE_REPS
+
+    default = _CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    times = {a: time_us(a) for a in _GEMM_CANDIDATES}
+    best = min(times, key=times.get)
+    if best != default:
+        # Re-time the two finalists alternately: clocks drift during tuning.
+        tb, td = float("inf"), float("inf")
+        for _ in range(3):
+            td = min(td, time_us(default))
+            tb = min(tb, time_us(best))
+        times[best], times[default] = tb, td
+        if not tb < _TUNE_MARGIN * td:
+            best = default
+    _GEMM_ALGO[key], _GEMM_LABEL[key] = best, label
+    _GEMM_TIMES[key] = {a: round(t, 2) for a, t in times.items()
+                        if t != float("inf")}
+    return best
+
+
 def gemm(a: Buffer, b: Buffer, c: Buffer, *, trans_a: bool = False,
          trans_b: bool = False, alpha: float = 1.0, beta: float = 0.0) -> None:
     """c = alpha · op(a) @ op(b) + beta · c, all row-major.
@@ -547,18 +643,32 @@ def gemm(a: Buffer, b: Buffer, c: Buffer, *, trans_a: bool = False,
     ab_type, c_type = _gemm_types(a, b, c)
     al = np.array(alpha, dtype=np.float32)
     be = np.array(beta, dtype=np.float32)
+    label = _shape_label(m, n, k, trans_a, trans_b)
+
     # Row-major C(m,n) = op(A) op(B)  ⇔  column-major Cᵀ(n,m) = op(B)ᵀ op(A)ᵀ.
-    with _Timed("gemm", 2.0 * m * n * k, _shape_label(m, n, k, trans_a, trans_b)):
-        _gemm_ex(a, b, c, m, n, k, trans_a, trans_b, ab_type, c_type, al, be)
+    def run(algo, out):
+        _gemm_ex(a, b, out, m, n, k, trans_a, trans_b, ab_type, c_type, al,
+                 be, algo)
+
+    key = (0, m, n, k, trans_a, trans_b, ab_type, c_type, beta != 0)
+    algo = _gemm_algo(key, _tuned_label(label, a, c, beta), run, c)
+    with _Timed("gemm", 2.0 * m * n * k, label):
+        run(algo, c)
 
 
-def _gemm_ex(a, b, c, m, n, k, trans_a, trans_b, ab_type, c_type, al, be):
+def _tuned_label(label, a, c, beta):
+    return (f"{label} {np.dtype(a.dtype).name}->{np.dtype(c.dtype).name}"
+            + (" +C" if beta != 0 else ""))
+
+
+def _gemm_ex(a, b, c, m, n, k, trans_a, trans_b, ab_type, c_type, al, be,
+             algo=_CUBLAS_GEMM_DEFAULT_TENSOR_OP):
     _cublas.gemmEx(
         _handle(), int(trans_b), int(trans_a), n, m, k,
         al.ctypes.data, b.ptr, ab_type, b.shape[1],
         a.ptr, ab_type, a.shape[1],
         be.ctypes.data, c.ptr, c_type, n,
-        _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+        _CUBLAS_COMPUTE_32F, algo)
 
 
 def gemm_batched(a: Buffer, b: Buffer, c: Buffer, *, trans_a: bool = False,
@@ -582,14 +692,20 @@ def gemm_batched(a: Buffer, b: Buffer, c: Buffer, *, trans_a: bool = False,
     ab_type, c_type = _gemm_types(a, b, c)
     al = np.array(alpha, dtype=np.float32)
     be = np.array(beta, dtype=np.float32)
-    with _Timed("gemm_batched", 2.0 * m * n * k * batch,
-                _shape_label(m, n, k, trans_a, trans_b, batch)):
-        _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type,
-                      c_type, al, be)
+    label = _shape_label(m, n, k, trans_a, trans_b, batch)
+
+    def run(algo, out):
+        _gemm_strided(a, b, out, m, n, k, batch, trans_a, trans_b, ab_type,
+                      c_type, al, be, algo)
+
+    key = (batch, m, n, k, trans_a, trans_b, ab_type, c_type, beta != 0)
+    algo = _gemm_algo(key, _tuned_label(label, a, c, beta), run, c)
+    with _Timed("gemm_batched", 2.0 * m * n * k * batch, label):
+        run(algo, c)
 
 
 def _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type, c_type,
-                  al, be):
+                  al, be, algo=_CUBLAS_GEMM_DEFAULT_TENSOR_OP):
     _cublas.gemmStridedBatchedEx(
         _handle(), int(trans_b), int(trans_a), n, m, k,
         al.ctypes.data,
@@ -597,4 +713,4 @@ def _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type, c_type,
         a.ptr, ab_type, a.shape[2], a.shape[1] * a.shape[2],
         be.ctypes.data,
         c.ptr, c_type, n, m * n,
-        batch, _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+        batch, _CUBLAS_COMPUTE_32F, algo)
