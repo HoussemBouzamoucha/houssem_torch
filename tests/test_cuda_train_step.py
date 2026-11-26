@@ -303,7 +303,8 @@ def test_bucketed_training_matches_full_width():
 
 
 def test_buckets_share_one_activation_block():
-    cfg = small_config()
+    # No attention biases: see test_bucketed_training_matches_full_width.
+    cfg = small_config(attention_bias=False)
     step = bucketed(cfg, [(4, 3), (S, T)], precision="fp32")
     small, large = step.bucket_bytes[(B, 4, 3)], step.bucket_bytes[(B, S, T)]
     assert 0 < small < large
