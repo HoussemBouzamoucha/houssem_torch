@@ -148,3 +148,21 @@ def test_timer_and_stream():
     assert ms >= 0.0
     np.testing.assert_allclose(c.numpy(), a.numpy() @ a.numpy(),
                                rtol=1e-3, atol=1e-3)
+
+
+def test_arena_measures_and_shares_one_block():
+    meter = driver.Arena()
+    a = meter.take((10, 3), np.float16)        # 60 bytes
+    b = meter.take(5, np.float32)              # aligned to 256, +20
+    assert a.shape == (10, 3) and b.shape == (5,)
+    assert not a.numpy().any()
+    assert meter.used == 256 + 20
+    arena = driver.Arena(meter.used)
+    one, two = arena.cursor(), arena.cursor()
+    x = one.take((10, 3), np.float16)
+    y = two.take(15, np.float32)               # same front of the block
+    x.copy_from(np.ones((10, 3), np.float16))
+    assert y.numpy()[0] != 0                   # overlaps x
+    one.take(5, np.float32)
+    with pytest.raises(MemoryError):
+        one.take(1, np.float32)

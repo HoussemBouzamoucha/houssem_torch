@@ -212,6 +212,53 @@ def zeros(shape, dtype=np.float32) -> Buffer:
     return Buffer(_cp.zeros(shape, dtype=_check_dtype(dtype)))
 
 
+class Arena:
+    """One block of device memory that buffers are carved from, front to back.
+
+        meter = Arena()                 # measuring: real buffers, bytes counted
+        ... build with meter.take ...   # -> meter.used
+        arena = Arena(meter.used)       # one block of that size
+        a, b = arena.cursor(), arena.cursor()
+
+    Each `cursor()` carves the same block again from its start, so the
+    buffers of different cursors overlap: for owners that never run at the
+    same time (e.g. the activations of training steps queued on one
+    stream). The block starts zeroed; later contents are whatever the last
+    owner left.
+    """
+
+    _ALIGN = 256
+
+    def __init__(self, nbytes: int | None = None):
+        _require()
+        self._mem = None if nbytes is None else _cp.zeros(max(int(nbytes), 1),
+                                                          np.uint8)
+        self.nbytes = None if nbytes is None else int(nbytes)
+        self.used = 0
+
+    def cursor(self) -> "Arena":
+        """A new carver over this block, starting at its front."""
+        if self._mem is None:
+            raise ValueError("a measuring Arena has no block to share")
+        c = Arena.__new__(Arena)
+        c._mem, c.nbytes, c.used = self._mem, self.nbytes, 0
+        return c
+
+    def take(self, shape, dtype=np.float32) -> Buffer:
+        """The next buffer of this shape and dtype."""
+        dtype = _check_dtype(dtype)
+        shape = (shape,) if isinstance(shape, (int, np.integer)) else tuple(shape)
+        n = int(np.prod(shape)) * dtype.itemsize
+        off = -(-self.used // self._ALIGN) * self._ALIGN
+        self.used = off + n
+        if self._mem is None:
+            return Buffer(_cp.zeros(shape, dtype))
+        if self.used > self.nbytes:
+            raise MemoryError(f"arena of {self.nbytes} bytes is full "
+                              f"(needs {self.used})")
+        return Buffer(self._mem[off:off + n].view(dtype).reshape(shape))
+
+
 def from_numpy(host: np.ndarray, dtype=None) -> Buffer:
     """Upload a host array (optionally casting it first)."""
     _require()

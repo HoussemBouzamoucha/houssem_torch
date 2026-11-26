@@ -125,6 +125,8 @@ class TrainStep:
     tune_gemms:   at startup, time every cuBLAS algorithm for each of this
                   step's matrix multiply shapes and keep the fastest (one
                   extra forward + backward; choices are shared process-wide).
+                  Off by default: on the T4, cuBLAS's default was already
+                  the fastest for 16 of 18 shapes (2026-11-26).
 
     `with_shape` builds another step for a different batch shape that
     trains the same parameters (see `BucketedTrainStep`).
@@ -136,8 +138,9 @@ class TrainStep:
                  weight_decay: float = 0.01, max_grad_norm: float | None = None,
                  seed: int = 0, init_scale: float = 2.0 ** 16,
                  growth_interval: int = 2000, device: int = 0,
-                 fused_attention: bool = True, tune_gemms: bool = True,
-                 _shared: TrainStep | None = None):
+                 fused_attention: bool = True, tune_gemms: bool = False,
+                 _shared: TrainStep | None = None,
+                 _arena: drv.Arena | None = None):
         if not drv.is_available():
             raise RuntimeError("TrainStep needs a CUDA GPU and CuPy.")
         if precision not in ("fp16", "fp32"):
@@ -176,6 +179,7 @@ class TrainStep:
         self.emb_scale = float(np.sqrt(cfg.d_model))
         self._rng = np.random.default_rng(seed)
         self._bufs: dict = {}
+        self._arena = _arena    # where activation buffers come from (None: own)
         info = drv.device_info(device)
         self._sms = info.multiprocessors
 
@@ -195,10 +199,10 @@ class TrainStep:
             self.scalars = _shared.scalars
         self._count = 1
         if tune_gemms:
-            self._tune_gemms()
+            self._warm_up(tune=True)
 
-    def with_shape(self, batch_size: int, src_len: int,
-                   tgt_len: int) -> "TrainStep":
+    def with_shape(self, batch_size: int, src_len: int, tgt_len: int,
+                   _arena: drv.Arena | None = None) -> "TrainStep":
         """A step for another batch shape that trains the same parameters.
 
         It shares this step's weights, gradients, AdamW moments, loss scale
@@ -207,7 +211,7 @@ class TrainStep:
         queue on the same GPU stream. Build all shapes before training.
         """
         return TrainStep(self._model, batch_size, src_len, tgt_len,
-                         **self._options, _shared=self)
+                         **self._options, _shared=self, _arena=_arena)
 
     # ------------------------------------------------------------------
     # Setup
@@ -239,9 +243,17 @@ class TrainStep:
                   "grad", "m", "v", "W", "G", "_rng"):
             setattr(self, k, getattr(other, k))
 
-    def _tune_gemms(self):
-        """One forward + backward on a random batch with cuBLAS algorithm
-        tuning on; leaves gradients zero and the dropout stream untouched."""
+    def _act(self, shape, dtype=None):
+        """A new activation buffer (zeroed), from the arena if there is one."""
+        dtype = self.dtype if dtype is None else dtype
+        if self._arena is not None:
+            return self._arena.take(shape, dtype)
+        return drv.zeros(shape, dtype)
+
+    def _warm_up(self, tune=False):
+        """One forward + backward on a random batch: allocates every buffer
+        the step uses (and tunes cuBLAS algorithms if asked). Leaves the
+        gradients zero and the dropout stream untouched."""
         cfg = self.cfg
         rng = np.random.default_rng(0)
 
@@ -251,7 +263,10 @@ class TrainStep:
             return a
 
         state = self._rng.bit_generator.state
-        with drv.gemm_tuning():
+        if tune:
+            with drv.gemm_tuning():
+                self.forward_backward(ids(self.S), ids(self.T), ids(self.T))
+        else:
             self.forward_backward(ids(self.S), ids(self.T), ids(self.T))
         self._rng.bit_generator.state = state
         self.grad.fill_(0)
@@ -340,7 +355,7 @@ class TrainStep:
         full = (key, tuple(shape), np.dtype(dtype).name)
         b = self._bufs.get(full)
         if b is None:
-            b = self._bufs[full] = drv.zeros(shape, dtype)
+            b = self._bufs[full] = self._act(shape, dtype)
         return b
 
     def _build_plan(self):
@@ -398,19 +413,19 @@ class TrainStep:
                 sub.res_seed, sub.inner_seed = slot(), slot()
             # Saved activations: one residual-stream site per LayerNorm.
             for _ in range(len(st.subs) + 1):
-                st.x.append(drv.zeros((st.M, d), self.dtype))
-                st.h.append(drv.zeros((st.M, d), self.dtype))
-                st.mean.append(drv.zeros(st.M, np.float32))
-                st.rstd.append(drv.zeros(st.M, np.float32))
+                st.x.append(self._act((st.M, d)))
+                st.h.append(self._act((st.M, d)))
+                st.mean.append(self._act(st.M, np.float32))
+                st.rstd.append(self._act(st.M, np.float32))
             for sub in st.subs:
                 self._alloc_sub(st, sub)
-        self.logits = drv.zeros((self.dec.M, cfg.vocab_size), self.dtype)
+        self.logits = self._act((self.dec.M, cfg.vocab_size))
         self._seeds = np.zeros(self._n_seeds, np.uint32)
 
     def _alloc_sub(self, st, sub):
         B, H, dk, d = self.B, self.H, self.dk, self.d
         BH, L = B * H, st.L
-        z = lambda *shape: drv.zeros(shape, self.dtype)  # noqa: E731
+        z = lambda *shape: self._act(shape)  # noqa: E731
         if self._attn(sub, st) is not None:
             # fused: keep the raw projections, the context and one
             # log-sum-exp per query row; nothing of size L x L.
@@ -419,7 +434,7 @@ class TrainStep:
             else:
                 sub.bufs.update(q=z(st.M, d), kv=z(self.B * self.S, 2 * d))
             sub.bufs.update(ctx=z(st.M, d),
-                            lse=drv.zeros(2 * B * H * L, np.float32))
+                            lse=self._act(2 * B * H * L, np.float32))
         elif sub.kind == "self":
             sub.bufs.update(heads=z(3, BH, L, dk), P=z(BH, L, L), Pd=z(BH, L, L),
                             ctx=z(st.M, d))
@@ -913,16 +928,20 @@ class BucketedTrainStep:
     buckets: (src_len, tgt_len) pairs using `batch_size` rows, or
              (batch_size, src_len, tgt_len) triples (e.g. more rows for
              shorter buckets, for a steady number of tokens per step).
+    share_memory: all buckets carve their activation buffers from one block
+             the size of the largest bucket's (they never run at the same
+             time: steps queue on one GPU stream). False: one set each.
     options: TrainStep keyword arguments (precision, betas, seed, ...).
 
     Inputs may be padded to any width: columns that are padding in every row
     are dropped, or padding columns added, to reach the bucket's width.
     Padding is masked everywhere, so a bucketed step gives the same loss and
     gradients as a full-width one up to rounding (dropout masks differ:
-    they depend on positions). Each bucket has its own activation buffers.
+    they depend on positions).
     """
 
-    def __init__(self, model: Transformer, batch_size: int, buckets, **options):
+    def __init__(self, model: Transformer, batch_size: int, buckets, *,
+                 share_memory: bool = True, **options):
         shapes = set()
         for b in buckets:
             b = tuple(int(x) for x in b)
@@ -932,11 +951,31 @@ class BucketedTrainStep:
         # Least work first, so the first bucket that fits is the cheapest.
         self.buckets = sorted(shapes, key=lambda s: (s[0] * (s[1] + s[2]), s))
         self.pad = model.cfg.pad_id
+        self.arena = None
+        self.bucket_bytes = {}      # activation bytes of each bucket
+        if share_memory:
+            # Measure each bucket's activations (a warm-up pass allocates the
+            # buffers made on first use), then build them all in one block.
+            meter_main = None
+            for shape in reversed(self.buckets):
+                meter = drv.Arena()
+                if meter_main is None:
+                    step = meter_main = TrainStep(model, *shape, **options,
+                                                  _arena=meter)
+                else:
+                    step = meter_main.with_shape(*shape, _arena=meter)
+                step._warm_up()
+                self.bucket_bytes[shape] = meter.used
+                del step
+            del meter_main
+            drv.synchronize()
+            self.arena = drv.Arena(max(self.bucket_bytes.values()))
         largest = self.buckets[-1]
-        main = TrainStep(model, *largest, **options)
+        cursor = (lambda: self.arena.cursor()) if share_memory else (lambda: None)
+        main = TrainStep(model, *largest, **options, _arena=cursor())
         self.steps = {largest: main}
         for shape in self.buckets[:-1]:
-            self.steps[shape] = main.with_shape(*shape)
+            self.steps[shape] = main.with_shape(*shape, _arena=cursor())
         self.main = main
         self.counts = dict.fromkeys(self.buckets, 0)   # batches per bucket
 

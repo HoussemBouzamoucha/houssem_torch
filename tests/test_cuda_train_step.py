@@ -239,7 +239,7 @@ def test_gemm_tuning_keeps_results():
     _, plain = build(cfg, precision="fp16", tune_gemms=False)
     assert driver.gemm_algorithms() == {}
     plain.forward_backward(src, tgt_in, tgt_out)
-    _, tuned = build(cfg, precision="fp16")
+    _, tuned = build(cfg, precision="fp16", tune_gemms=True)
     assert driver.gemm_algorithms()
     assert not tuned.grad.numpy().any()          # tuning left no gradients
     tuned.forward_backward(src, tgt_in, tgt_out)
@@ -300,3 +300,22 @@ def test_bucketed_training_matches_full_width():
         pytest.approx(full.evaluate(src, tgt_in, tgt_out), rel=1e-5)
     with pytest.raises(ValueError):
         step.bucket(src[:2], tgt_in[:2], tgt_out[:2])   # no 2-row bucket
+
+
+def test_buckets_share_one_activation_block():
+    cfg = small_config()
+    step = bucketed(cfg, [(4, 3), (S, T)], precision="fp32")
+    small, large = step.bucket_bytes[(B, 4, 3)], step.bucket_bytes[(B, S, T)]
+    assert 0 < small < large
+    assert step.arena.nbytes == large       # one block, not small + large
+    separate = bucketed(cfg, [(4, 3), (S, T)], precision="fp32",
+                        share_memory=False)
+    assert separate.arena is None
+    for s_ in range(4):
+        b = short_batch(cfg, s_) if s_ % 2 else batch(cfg, s_)
+        step(*b, lr=3e-3)
+        separate(*b, lr=3e-3)
+    got, ref = step.state_dict(), separate.state_dict()
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-5, atol=1e-6,
+                                   err_msg=k)
