@@ -685,6 +685,136 @@
     "houssem_torch": "855-1215",
     "torch.compile": "975-1275"
    }
+  },
+  {
+   "date": "2026-11-26",
+   "time_utc+1": "16:14",
+   "commit": "ac0503f",
+   "branch": "gpu/gemm-tuning-buckets",
+   "gpus": {
+    "houssem_torch": "cuda:1",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "55 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 49.5,
+     "torch.compile": 62.6,
+     "PyTorch eager": 76.0
+    },
+    "64": {
+     "houssem_torch": 92.1,
+     "torch.compile": 106.2,
+     "PyTorch eager": 131.2
+    },
+    "96": {
+     "houssem_torch": 128.1,
+     "torch.compile": 154.1,
+     "PyTorch eager": 187.1
+    }
+   },
+   "speedup_vs_compile_b64": 1.153,
+   "setup_s": {
+    "houssem_torch": 0.5,
+    "torch.compile": 2.2
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.2,
+    "PyTorch eager": 2.69
+   },
+   "breakdown_ms_b64": {
+    "matrix multiplies": {
+     "houssem_torch": 59.9,
+     "torch.compile": 52.1,
+     "PyTorch eager": 49.2
+    },
+    "attention": {
+     "houssem_torch": 10.5,
+     "torch.compile": 10.7,
+     "PyTorch eager": 18.2
+    },
+    "LayerNorm + residual": {
+     "houssem_torch": 5.6,
+     "torch.compile": 12.4,
+     "PyTorch eager": 5.8
+    },
+    "activation, dropout, bias": {
+     "houssem_torch": 5.7,
+     "torch.compile": 13.3,
+     "PyTorch eager": 46.1
+    },
+    "loss": {
+     "houssem_torch": 1.1,
+     "torch.compile": 5.0,
+     "PyTorch eager": 0.0
+    },
+    "optimizer": {
+     "houssem_torch": 7.9,
+     "torch.compile": 12.3,
+     "PyTorch eager": 11.3
+    },
+    "embedding, other": {
+     "houssem_torch": 1.2,
+     "torch.compile": 0.4,
+     "PyTorch eager": 0.4
+    }
+   },
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 271,
+     "torch.compile": 325
+    },
+    "val_loss": {
+     "houssem_torch": 4.7822,
+     "torch.compile": 4.784
+    },
+    "wall_speedup": 1.199
+   },
+   "length_buckets_3000_steps": {
+    "buckets": [
+     16,
+     32,
+     48,
+     64
+    ],
+    "batching": "token budget: pairs per batch {16: 152, 32: 64, 48: 40, 64: 32}, 1487 target tokens per batch (fixed 64/64: 1471)",
+    "share": {
+     "16": 0.14,
+     "32": 0.37,
+     "48": 0.32,
+     "64": 0.17
+    },
+    "wall_s": {
+     "houssem_torch": 149,
+     "torch.compile": 257
+    },
+    "steady_ms_per_step": {
+     "houssem_torch": 49.6,
+     "torch.compile": 63.9
+    },
+    "fixed_steady_ms_per_step": {
+     "houssem_torch": 90.2,
+     "torch.compile": 107.5
+    },
+    "val_loss": {
+     "houssem_torch": 4.8722,
+     "torch.compile": 4.8641
+    },
+    "setup_s": {
+     "houssem_torch": 1.4
+    },
+    "memory_gb": {
+     "houssem_torch": 2.03,
+     "torch.compile": 1.62
+    },
+    "note": "Shared activation block: bucket memory 3.76 -> 2.03 GB (= fixed step). Token budget narrowed the val-loss gap to fixed batches from +0.27 to +0.09, same for both engines. torch.compile wall includes one compile per bucket (~65 s before step 250)."
+   },
+   "notes": "tune_gemms off (new default). Step benchmark ran houssem first at a low clock (585 MHz idle before training, power cap): 1.15x at b64 is low vs the 1.20x training-wall ratio of the same run.",
+   "sm_clock_mhz_during_training": {
+    "houssem_torch": "855-1215",
+    "torch.compile": "975-1275"
+   }
   }
  ]
 }

@@ -65,9 +65,32 @@ batches, only 38% of the target slots are real tokens.
   faster than ours and late rows 1.4× slower. Only the total compares, and it is
   within 2%.
 
+## Follow-up run, 16:14 (`ac0503f`): token budget, shared memory, tuning off
+
+55 GPU tests pass. Each bucket now gets about the same number of target tokens:
+{16: 152, 32: 64, 48: 40, 64: 32} pairs per batch, or 1487 target tokens per batch
+against 1471 for fixed 64/64. Buckets share one activation block, and cuBLAS
+tuning is off.
+
+| engine | buckets wall s | steady ms/step | val loss | fixed wall s | fixed ms/step | fixed val |
+|---|---:|---:|---:|---:|---:|---:|
+| houssem_torch | **149** | **49.6** | 4.872 | 271 | 90.2 | 4.782 |
+| torch.compile | 257 | 63.9 | 4.864 | 325 | 107.5 | 4.784 |
+
+- **Speed:** with buckets, houssem_torch is **1.82× faster than its own fixed
+  batches** (training wall time) and **1.29× faster than torch.compile** on the
+  same buckets (steady ms/step).
+- **Memory: 3.76 → 2.03 GB**, the same as one fixed step. Setup 8.5 → 1.4 s.
+- **Val loss:** the gap to fixed batches shrank from +0.27 to **+0.09**, and it is
+  the same for both engines. This compares equal steps and tokens. It does not
+  compare equal time: by 149 s, the fixed run was only at step ~1650.
+- **Fixed 64/64 step benchmark: 1.15×** (92.1 vs 106.2). That is low next to this
+  run's training wall ratio of 1.20× (271 vs 325 s). houssem_torch ran first,
+  starting from a 585 MHz idle clock.
+
 ## Next
 
-1. **Token-budget buckets:** more pairs for short buckets, e.g. (256, 16), (128, 32),
+1. **Token-budget buckets:** done (above). more pairs for short buckets, e.g. (256, 16), (128, 32),
    (80, 48), (64, 64). `BucketedTrainStep` already accepts `(batch, src, tgt)`.
    Compare at an equal number of tokens or epochs, not equal steps.
 2. **Turn tuning off by default** (`tune_gemms=False`). It costs startup time for
