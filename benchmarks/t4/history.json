@@ -545,6 +545,146 @@
     "houssem_torch": "975-1215",
     "torch.compile": "1020-1290"
    }
+  },
+  {
+   "date": "2026-11-26",
+   "time_utc+1": "15:41",
+   "commit": "b920e4a",
+   "branch": "gpu/gemm-tuning-buckets",
+   "gpus": {
+    "houssem_torch": "cuda:1",
+    "pytorch": "cuda:1"
+   },
+   "tests_on_t4": "53 passed",
+   "step_ms": {
+    "32": {
+     "houssem_torch": 45.2,
+     "torch.compile": 58.2,
+     "PyTorch eager": 70.5
+    },
+    "64": {
+     "houssem_torch": 84.0,
+     "torch.compile": 106.3,
+     "PyTorch eager": 128.1
+    },
+    "96": {
+     "houssem_torch": 136.4,
+     "torch.compile": 151.7,
+     "PyTorch eager": 187.8
+    }
+   },
+   "speedup_vs_compile_b64": 1.265,
+   "setup_s": {
+    "houssem_torch": 0.6,
+    "torch.compile": 30.6
+   },
+   "memory_gb": {
+    "houssem_torch": 2.03,
+    "torch.compile": 2.19,
+    "PyTorch eager": 2.68
+   },
+   "breakdown_ms_b64": {
+    "matrix multiplies": {
+     "houssem_torch": 54.2,
+     "torch.compile": 52.6,
+     "PyTorch eager": 49.0
+    },
+    "attention": {
+     "houssem_torch": 9.7,
+     "torch.compile": 10.7,
+     "PyTorch eager": 17.8
+    },
+    "LayerNorm + residual": {
+     "houssem_torch": 5.2,
+     "torch.compile": 12.3,
+     "PyTorch eager": 5.6
+    },
+    "activation, dropout, bias": {
+     "houssem_torch": 5.3,
+     "torch.compile": 13.2,
+     "PyTorch eager": 44.4
+    },
+    "loss": {
+     "houssem_torch": 1.1,
+     "torch.compile": 5.0,
+     "PyTorch eager": 0.0
+    },
+    "optimizer": {
+     "houssem_torch": 7.4,
+     "torch.compile": 12.2,
+     "PyTorch eager": 10.9
+    },
+    "embedding, other": {
+     "houssem_torch": 1.1,
+     "torch.compile": 0.4,
+     "PyTorch eager": 0.4
+    }
+   },
+   "training_3000_steps": {
+    "wall_s": {
+     "houssem_torch": 268,
+     "torch.compile": 325
+    },
+    "val_loss": {
+     "houssem_torch": 4.7523,
+     "torch.compile": 4.792
+    },
+    "wall_speedup": 1.213
+   },
+   "length_buckets_3000_steps": {
+    "buckets": [
+     16,
+     32,
+     48,
+     64
+    ],
+    "batch": 64,
+    "share": {
+     "16": 0.34,
+     "32": 0.38,
+     "48": 0.2,
+     "64": 0.08
+    },
+    "wall_s": {
+     "houssem_torch": 154,
+     "torch.compile": 286
+    },
+    "steady_ms_per_step": {
+     "houssem_torch": 51.3,
+     "torch.compile": 64.7
+    },
+    "fixed_steady_ms_per_step": {
+     "houssem_torch": 89.0,
+     "torch.compile": 107.5
+    },
+    "val_loss": {
+     "houssem_torch": 5.0179,
+     "torch.compile": 5.0151
+    },
+    "setup_s": {
+     "houssem_torch": 8.5
+    },
+    "memory_gb": {
+     "houssem_torch": 3.76,
+     "torch.compile": 2.19
+    },
+    "note": "torch.compile wall includes compiling one graph per bucket (~95 s before step 250). Val loss is worse than fixed 64/64 for BOTH engines: a fixed 64 pairs per step gives short-sentence batches few tokens, so it is a batching effect, not an engine bug."
+   },
+   "gemm_bench_b64_us_per_step": {
+    "default": 58920,
+    "tuned": 60112,
+    "torch_matmul": 57962,
+    "non_default_choices": {
+     "512x2048x4096 A^T": 106,
+     "4096x1536x512": 103
+    },
+    "note": "Tuning gained nothing: default algorithm best for 16/18 shapes, total 2% slower tuned (measured second, GPU hotter). torch.matmul column was timed shape after shape, so the per-shape numbers drift with the power-capped clock; only the total is comparable."
+   },
+   "notes": "Startup cuBLAS algorithm tuning on (no measurable effect). Both engines on cuda:1. SM clock 855-1215 MHz under load (power cap).",
+   "sm_clock_mhz_during_training": {
+    "houssem_torch": "855-1215",
+    "torch.compile": "975-1275"
+   }
   }
  ]
 }
