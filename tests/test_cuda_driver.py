@@ -115,6 +115,27 @@ def test_gemm_batched(trans_b):
     np.testing.assert_allclose(s.numpy(), ref, rtol=1e-4, atol=1e-4)
 
 
+def test_gemm_tuning_picks_a_working_algorithm():
+    driver.reset_gemm_algorithms()
+    m, n, k = 96, 80, 64
+    a = driver.from_numpy(rng.standard_normal((m, k)).astype(np.float16))
+    b = driver.from_numpy((rng.standard_normal((k, n)) / 8).astype(np.float16))
+    ab = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
+    c0 = rng.standard_normal((m, n)).astype(np.float32)
+    c = driver.from_numpy(c0)
+    with driver.gemm_tuning():
+        driver.gemm(a, b, c, beta=1.0)
+    # Candidates are timed on a scratch output: c got exactly one multiply.
+    np.testing.assert_allclose(c.numpy(), ab + c0, rtol=1e-2, atol=1e-2)
+    (label, info), = driver.gemm_algorithms().items()
+    assert label == "96x80x64 float16->float32 +C"
+    assert info["algo"] in info["us"]
+    driver.gemm(a, b, c, beta=1.0)                      # reuses the choice
+    np.testing.assert_allclose(c.numpy(), 2 * ab + c0, rtol=1e-2, atol=1e-2)
+    driver.reset_gemm_algorithms()
+    assert driver.gemm_algorithms() == {}
+
+
 def test_timer_and_stream():
     a = driver.from_numpy(rng.standard_normal((256, 256)).astype(np.float32))
     c = driver.empty((256, 256))
@@ -127,3 +148,21 @@ def test_timer_and_stream():
     assert ms >= 0.0
     np.testing.assert_allclose(c.numpy(), a.numpy() @ a.numpy(),
                                rtol=1e-3, atol=1e-3)
+
+
+def test_arena_measures_and_shares_one_block():
+    meter = driver.Arena()
+    a = meter.take((10, 3), np.float16)        # 60 bytes
+    b = meter.take(5, np.float32)              # aligned to 256, +20
+    assert a.shape == (10, 3) and b.shape == (5,)
+    assert not a.numpy().any()
+    assert meter.used == 256 + 20
+    arena = driver.Arena(meter.used)
+    one, two = arena.cursor(), arena.cursor()
+    x = one.take((10, 3), np.float16)
+    y = two.take(15, np.float32)               # same front of the block
+    x.copy_from(np.ones((10, 3), np.float16))
+    assert y.numpy()[0] != 0                   # overlaps x
+    one.take(5, np.float32)
+    with pytest.raises(MemoryError):
+        one.take(1, np.float32)

@@ -222,3 +222,101 @@ def test_queued_steps_match_synchronized_steps():
     for k in ref:  # float atomics in the bias gradients: rounding only
         np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-6,
                                    err_msg=k)
+
+
+def assert_grads_close(a, b, tol):
+    for name in b:
+        err = np.linalg.norm(a[name] - b[name]) / (np.linalg.norm(b[name]) + 1e-8)
+        if np.linalg.norm(b[name]) > 1e-4:   # near-zero grads: rounding noise
+            assert err < tol, (name, err)
+
+
+def test_gemm_tuning_keeps_results():
+    """Tuned cuBLAS algorithms change rounding only."""
+    cfg = small_config()
+    src, tgt_in, tgt_out = batch(cfg)
+    driver.reset_gemm_algorithms()
+    _, plain = build(cfg, precision="fp16", tune_gemms=False)
+    assert driver.gemm_algorithms() == {}
+    plain.forward_backward(src, tgt_in, tgt_out)
+    _, tuned = build(cfg, precision="fp16", tune_gemms=True)
+    assert driver.gemm_algorithms()
+    assert not tuned.grad.numpy().any()          # tuning left no gradients
+    tuned.forward_backward(src, tgt_in, tgt_out)
+    assert tuned.last_loss() == pytest.approx(plain.last_loss(), rel=1e-3)
+    assert_grads_close(tuned.gradients(), plain.gradients(), 2e-2)
+
+
+def short_batch(cfg, seed=0):
+    """A batch whose tokens fit 4 source / 3 target columns, padded to S/T."""
+    src, tgt_in, tgt_out = batch(cfg, seed)
+    src[:, 4:] = cfg.pad_id
+    tgt_in[:, 3:] = cfg.pad_id
+    tgt_out[:, 3:] = cfg.pad_id
+    return src, tgt_in, tgt_out
+
+
+def bucketed(cfg, buckets, **kw):
+    from houssem_torch.backends.cuda.train_step import BucketedTrainStep
+    ht.manual_seed(0)
+    return BucketedTrainStep(Transformer(cfg), B, buckets, **kw)
+
+
+@pytest.mark.parametrize("precision", ["fp32", "fp16"])
+def test_bucketed_step_matches_full_width(precision):
+    cfg = small_config()
+    src, tgt_in, tgt_out = short_batch(cfg)
+    _, full = build(cfg, precision=precision)
+    step = bucketed(cfg, [(4, 3), (S, T)], precision=precision)
+    assert step.bucket(src, tgt_in, tgt_out) == (B, 4, 3)
+    assert step.bucket(*batch(cfg)) == (B, S, T)
+    full.forward_backward(src, tgt_in, tgt_out)
+    step.forward_backward(src, tgt_in, tgt_out)
+    half = precision == "fp16"
+    assert step.last_loss() == pytest.approx(full.last_loss(),
+                                             rel=2e-3 if half else 1e-5)
+    assert_grads_close(step.gradients(), full.gradients(), 2e-2 if half else 1e-4)
+
+
+def test_bucketed_training_matches_full_width():
+    """Short and full batches mixed: every bucket updates the same weights.
+    No attention biases: the key bias gradient is pure rounding noise, which
+    AdamW would blow up into different updates per shape."""
+    cfg = small_config(attention_bias=False)
+    data = [short_batch(cfg, s) if s % 2 else batch(cfg, s) for s in range(6)]
+    _, full = build(cfg)
+    step = bucketed(cfg, [(4, 3), (S, T)], precision="fp32")
+    for b in data:
+        full(*b, lr=3e-3)
+        step(*b, lr=3e-3)
+    assert step.counts == {(B, 4, 3): 3, (B, S, T): 3}
+    got, ref = step.state_dict(), full.state_dict()
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-5,
+                                   err_msg=k)
+    # Inputs narrower than the bucket are padded up to it.
+    src, tgt_in, tgt_out = short_batch(cfg)
+    assert step.evaluate(src[:, :4], tgt_in[:, :3], tgt_out[:, :3]) == \
+        pytest.approx(full.evaluate(src, tgt_in, tgt_out), rel=1e-5)
+    with pytest.raises(ValueError):
+        step.bucket(src[:2], tgt_in[:2], tgt_out[:2])   # no 2-row bucket
+
+
+def test_buckets_share_one_activation_block():
+    # No attention biases: see test_bucketed_training_matches_full_width.
+    cfg = small_config(attention_bias=False)
+    step = bucketed(cfg, [(4, 3), (S, T)], precision="fp32")
+    small, large = step.bucket_bytes[(B, 4, 3)], step.bucket_bytes[(B, S, T)]
+    assert 0 < small < large
+    assert step.arena.nbytes == large       # one block, not small + large
+    separate = bucketed(cfg, [(4, 3), (S, T)], precision="fp32",
+                        share_memory=False)
+    assert separate.arena is None
+    for s_ in range(4):
+        b = short_batch(cfg, s_) if s_ % 2 else batch(cfg, s_)
+        step(*b, lr=3e-3)
+        separate(*b, lr=3e-3)
+    got, ref = step.state_dict(), separate.state_dict()
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-5, atol=1e-6,
+                                   err_msg=k)

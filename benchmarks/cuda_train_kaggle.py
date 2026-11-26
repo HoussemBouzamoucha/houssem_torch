@@ -21,7 +21,7 @@
 
 # %% Cell 1: settings
 REPO_URL = "https://github.com/HoussemBouzamoucha/houssem_torch.git"
-BRANCH = "gpu/attention-v3"
+BRANCH = "gpu/gemm-tuning-buckets"
 WORK = "/kaggle/working"
 REPO_DIR = f"{WORK}/houssem_torch"
 
@@ -38,6 +38,7 @@ WARMUP_STEPS, LR_FACTOR = 2000, 1.0     # Noam schedule
 MAX_GRAD_NORM = 1.0
 LOG_EVERY = 250
 TORCH_TRAIN_MODE = "compile"    # PyTorch training run: "compile" or "eager"
+LEN_BUCKETS = (16, 32, 48, 64)  # Cell 12b: length buckets (both lengths)
 
 # %% Cell 2: get the code (git clone the first time, git pull afterwards)
 import os
@@ -163,11 +164,11 @@ print(f"kept {len(train_ids):,}/{len(train_pairs):,} train pairs that fit "
       f"{SRC_LEN}/{TGT_LEN} tokens")
 
 
-def to_batch(chunk):
+def to_batch(chunk, S=SRC_LEN, T=TGT_LEN):
     B = len(chunk)
-    src = np.full((B, SRC_LEN), PAD, np.int64)
-    tgt_in = np.full((B, TGT_LEN), PAD, np.int64)
-    tgt_out = np.full((B, TGT_LEN), PAD, np.int64)
+    src = np.full((B, S), PAD, np.int64)
+    tgt_in = np.full((B, T), PAD, np.int64)
+    tgt_out = np.full((B, T), PAD, np.int64)
     for i, (s, t) in enumerate(chunk):
         src[i, :len(s)] = s
         tgt_in[i, 0], tgt_in[i, 1:len(t) + 1] = BOS, t
@@ -229,7 +230,7 @@ import time
 
 import cupy as cp
 import houssem_torch as ht
-from houssem_torch.backends.cuda.train_step import TrainStep
+from houssem_torch.backends.cuda.train_step import BucketedTrainStep, TrainStep
 from houssem_torch.models import Transformer
 from houssem_torch.optim import noam_lr
 import t4_profile as tp
@@ -280,10 +281,11 @@ def build_torch(state):
     return model, opt, scaler
 
 
-def torch_step_fn(model, opt, scaler, mode):
+def torch_step_fn(model, opt, scaler, mode, dynamic=None):
     if mode != "eager":
         torch._dynamo.reset()      # fresh compile for each model / shape
-    loss_fn = model.loss if mode == "eager" else torch.compile(model.loss)
+    loss_fn = model.loss if mode == "eager" else torch.compile(model.loss,
+                                                               dynamic=dynamic)
 
     def step(batch, lr):
         for g in opt.param_groups:
@@ -485,26 +487,28 @@ def val_loss_ht(step):
     return float(np.mean([step.evaluate(*b) for b in val_batches]))
 
 
-def train_ht():
-    step, _ = build_ht()
+def train_ht(build=build_ht, make_stream=None, tag="houssem", save=True):
+    step, setup = build()
     log, t0 = [], time.perf_counter()
-    stream = Timed(train_stream(TRAIN_STEPS))
+    stream = Timed((make_stream or train_stream)(TRAIN_STEPS))
     for i, b in enumerate(stream, start=1):
         step(*b, lr=noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
             loss, el = step.last_loss(), time.perf_counter() - t0
             log.append((i, loss, el))
-            print(f"[houssem] step {i:6d}  loss {loss:.4f}  {el:7.1f}s  "
+            print(f"[{tag}] step {i:6d}  loss {loss:.4f}  {el:7.1f}s  "
                   f"data {stream.s:5.1f}s  {sm_clock(HT_GPU)}  "
                   f"scale {step.stats()['loss_scale']:.0f}", flush=True)
     drv.synchronize()
     wall = time.perf_counter() - t0
     val = val_loss_ht(step)
     state = step.state_dict()
-    np.savez(f"{WORK}/houssem_gpu_checkpoint.npz", **state)
+    mem = drv.memory_in_use() / 2 ** 30
+    if save:
+        np.savez(f"{WORK}/houssem_gpu_checkpoint.npz", **state)
     del step
     free_gpu()
-    return dict(log=log, wall=wall, val=val, state=state)
+    return dict(log=log, wall=wall, val=val, state=state, setup=setup, mem_gb=mem)
 
 
 gpu_status("before houssem_torch training")
@@ -514,11 +518,12 @@ print(f"houssem_torch: {TRAIN_STEPS} steps in {ht_run['wall']:.0f}s, "
       f"val loss {ht_run['val']:.4f}")
 
 # %% Cell 12: train PyTorch on the same batches
-def train_torch(mode):
+def train_torch(mode, make_stream=None, dynamic=None, save=True):
     model, opt, scaler = build_torch(init_state)
-    step = torch_step_fn(model, opt, scaler, mode)
+    step = torch_step_fn(model, opt, scaler, mode, dynamic)
+    torch.cuda.reset_peak_memory_stats(torch_dev)
     log, t0 = [], time.perf_counter()
-    stream = Timed(train_stream(TRAIN_STEPS))
+    stream = Timed((make_stream or train_stream)(TRAIN_STEPS))
     for i, b in enumerate(stream, start=1):
         loss = step(to_torch(b), noam_lr(i, cfg.d_model, WARMUP_STEPS, LR_FACTOR))
         if i % LOG_EVERY == 0 or i == TRAIN_STEPS:
@@ -532,10 +537,12 @@ def train_torch(mode):
     model.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         val = float(np.mean([float(model.loss(*to_torch(b))) for b in val_batches]))
-    torch.save(model.state_dict(), f"{WORK}/torch_checkpoint.pt")
+    if save:
+        torch.save(model.state_dict(), f"{WORK}/torch_checkpoint.pt")
+    mem = torch.cuda.max_memory_allocated(torch_dev) / 2 ** 30
     del model, opt, scaler, step
     free_gpu()
-    return dict(log=log, wall=wall, val=val)
+    return dict(log=log, wall=wall, val=val, mem_gb=mem)
 
 
 gpu_status("before PyTorch training")
@@ -543,6 +550,107 @@ torch_run = train_torch(TORCH_TRAIN_MODE)
 gpu_status("after PyTorch training")
 print(f"PyTorch {TORCH_TRAIN_MODE}: {TRAIN_STEPS} steps in {torch_run['wall']:.0f}s,"
       f" val loss {torch_run['val']:.4f}")
+
+# %% Cell 12b: length buckets: the same sentences, batched by length
+# Above, every batch is padded to 64/64 tokens (mostly padding). Here each
+# pair goes to the smallest bucket in LEN_BUCKETS that holds it, batches are
+# made within a bucket and each runs at its bucket's width. Token budget:
+# shorter buckets take more pairs, so every batch has about as many target
+# tokens as a fixed BATCH-pair batch (with a fixed pair count, short batches
+# had few tokens and the val loss suffered, 2026-11-26). Same number of
+# steps, so both runs see about the same number of tokens.
+# houssem_torch: BucketedTrainStep (one compiled step per bucket, shared
+# weights, one shared activation block). PyTorch: torch.compile(dynamic=False),
+# one graph per bucket. Both see the same batches in the same order.
+def bucket_of(pair):
+    need = max(len(pair[0]), len(pair[1]) + 1)
+    return next(L for L in LEN_BUCKETS if L >= need)
+
+
+tgt_tokens = {L: [] for L in LEN_BUCKETS}
+for pair in train_ids:
+    tgt_tokens[bucket_of(pair)].append(len(pair[1]) + 1)
+mean_tokens = np.mean([len(t) + 1 for _, t in train_ids])
+BUCKET_BATCH = {L: max(8, int(round(BATCH * mean_tokens / np.mean(v) / 8)) * 8)
+                for L, v in tgt_tokens.items()}
+print("pairs per batch by bucket:", BUCKET_BATCH, f"(~{BATCH * mean_tokens:.0f} "
+      "target tokens per batch)")
+
+
+def bucketed_batches(data, epoch_seed):
+    rng_ = np.random.default_rng(epoch_seed)
+    groups = {L: [] for L in LEN_BUCKETS}
+    for j in rng_.permutation(len(data)):
+        groups[bucket_of(data[j])].append(j)
+    made = [(L, idx[i:i + BUCKET_BATCH[L]]) for L, idx in groups.items()
+            for i in range(0, len(idx) - BUCKET_BATCH[L] + 1, BUCKET_BATCH[L])]
+    for k in rng_.permutation(len(made)):
+        L, idx = made[k]
+        yield to_batch([data[j] for j in idx], L, L)
+
+
+def bucketed_stream(n_steps):
+    epoch, made = 0, 0
+    while made < n_steps:
+        for b in bucketed_batches(train_ids, SEED + epoch):
+            yield b
+            made += 1
+            if made == n_steps:
+                return
+        epoch += 1
+
+
+def build_ht_bucketed():
+    cpu_model.load_state_dict(init_state)
+    t0 = time.perf_counter()
+    shapes = [(BUCKET_BATCH[L], L, L) for L in LEN_BUCKETS]
+    shapes.append((BATCH, SRC_LEN, TGT_LEN))     # the fixed val batches
+    step = BucketedTrainStep(cpu_model, BATCH, shapes,
+                             precision="fp16", max_grad_norm=MAX_GRAD_NORM,
+                             seed=SEED, device=HT_GPU, **ADAM)
+    drv.synchronize()
+    return step, time.perf_counter() - t0
+
+
+def steady_ms(log):
+    """ms/step between the first and last log points (no compile/setup)."""
+    (i0, _, t0_), (i1, _, t1_) = log[0], log[-1]
+    return (t1_ - t0_) / (i1 - i0) * 1e3
+
+
+stream_stats = [(b[0].shape[1], int((b[2] != PAD).sum()))
+                for b in bucketed_stream(TRAIN_STEPS)]
+widths = [w for w, _ in stream_stats]
+fill_fixed = np.mean([(b[2] != PAD).mean() for b in val_batches])
+bucket_tokens = float(np.mean([n for _, n in stream_stats]))
+print("bucket share of the training batches: " + ", ".join(
+    f"{L}: {widths.count(L) / len(widths):.0%}" for L in LEN_BUCKETS)
+    + f"; {bucket_tokens:.0f} target tokens per batch (fixed: "
+    f"{bench_tokens:.0f}, {fill_fixed:.0%} of the 64/64 slots)")
+gpu_status("before bucketed training")
+ht_bucket_run = train_ht(build_ht_bucketed, bucketed_stream, "houssem buckets",
+                         save=False)
+torch_bucket_run = train_torch("compile", bucketed_stream, dynamic=False,
+                               save=False)
+gpu_status("after bucketed training")
+bucket_runs = {
+    "buckets": list(LEN_BUCKETS),
+    "share": {str(L): widths.count(L) / len(widths) for L in LEN_BUCKETS},
+    "pairs_per_batch": {str(L): b for L, b in BUCKET_BATCH.items()},
+    "target_tokens_per_batch": bucket_tokens,
+    HT: {k: ht_bucket_run[k] for k in ("log", "wall", "val", "setup", "mem_gb")},
+    TC: {k: torch_bucket_run[k] for k in ("log", "wall", "val", "mem_gb")},
+}
+for name, run_fixed, run_b in ((HT, ht_run, ht_bucket_run),
+                               (TC, torch_run, torch_bucket_run)):
+    bucket_runs[name]["steady_ms"] = steady_ms(run_b["log"])
+    print(f"{name:14s} buckets: {run_b['wall']:6.0f} s, "
+          f"{steady_ms(run_b['log']):5.1f} ms/step steady, val {run_b['val']:.4f}"
+          f"  | fixed 64/64: {run_fixed['wall']:6.0f} s, "
+          f"{steady_ms(run_fixed['log']):5.1f} ms/step, val {run_fixed['val']:.4f}")
+print(f"houssem_torch bucketed setup {ht_bucket_run['setup']:.1f} s, memory "
+      f"{ht_bucket_run['mem_gb']:.2f} GB; torch.compile bucketed peak memory "
+      f"{torch_bucket_run['mem_gb']:.2f} GB")
 
 # %% Cell 13: a few translations from the houssem_torch weights (CPU, greedy)
 cpu_model.load_state_dict(ht_run["state"])
@@ -722,6 +830,19 @@ lines += [
 ]
 for (i, a, _), (_, b, _) in zip(ht_run["log"], torch_run["log"]):
     lines.append(f"| {i} | {a:.4f} | {b:.4f} |")
+lines += ["", f"## Length buckets {list(LEN_BUCKETS)}, {TRAIN_STEPS} steps each, "
+          "same batches", "",
+          "Bucket share: " + ", ".join(f"{L}: {v:.0%}" for L, v in
+                                       bucket_runs["share"].items())
+          + f". Pairs per batch: {BUCKET_BATCH}, {bucket_tokens:.0f} target "
+          f"tokens per batch (fixed 64/64: {bench_tokens:.0f}).", "",
+          "| engine | wall s | steady ms/step | val loss | fixed 64/64 wall s | "
+          "fixed ms/step | fixed val |", "|---|---:|---:|---:|---:|---:|---:|"]
+for name, run_fixed, run_b in ((HT, ht_run, ht_bucket_run),
+                               (TC, torch_run, torch_bucket_run)):
+    lines.append(f"| {name} | {run_b['wall']:.0f} | {steady_ms(run_b['log']):.1f}"
+                 f" | {run_b['val']:.4f} | {run_fixed['wall']:.0f} | "
+                 f"{steady_ms(run_fixed['log']):.1f} | {run_fixed['val']:.4f} |")
 lines += ["", "## Sample translations (houssem_torch weights, greedy)", ""]
 for s_, r_, h_ in translations:
     lines += [f"- src: {s_}", f"  - ref: {r_}", f"  - hyp: {h_}"]
