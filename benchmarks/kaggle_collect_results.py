@@ -69,6 +69,8 @@ if all(k in g for k in ("sweep", "breakdown", "ht_run", "torch_run")):
             "torch": {k: g["torch_run"][k] for k in ("log", "wall", "val")},
         },
         "translations": g.get("translations"),
+        "length_buckets": g.get("bucket_runs"),
+        "gemm_algorithms": (g["drv"].gemm_algorithms() if "drv" in g else None),
     }
     with open(os.path.join(out, "results.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=float)
