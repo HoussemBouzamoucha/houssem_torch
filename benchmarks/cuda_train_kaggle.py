@@ -554,22 +554,36 @@ print(f"PyTorch {TORCH_TRAIN_MODE}: {TRAIN_STEPS} steps in {torch_run['wall']:.0
 # %% Cell 12b: length buckets: the same sentences, batched by length
 # Above, every batch is padded to 64/64 tokens (mostly padding). Here each
 # pair goes to the smallest bucket in LEN_BUCKETS that holds it, batches are
-# made within a bucket (still BATCH pairs each), and each runs at its
-# bucket's width. houssem_torch: BucketedTrainStep (one compiled step per
-# bucket, shared weights). PyTorch: torch.compile(dynamic=False), one graph
-# per bucket. Both see the same batches in the same order.
+# made within a bucket and each runs at its bucket's width. Token budget:
+# shorter buckets take more pairs, so every batch has about as many target
+# tokens as a fixed BATCH-pair batch (with a fixed pair count, short batches
+# had few tokens and the val loss suffered, 2026-11-26). Same number of
+# steps, so both runs see about the same number of tokens.
+# houssem_torch: BucketedTrainStep (one compiled step per bucket, shared
+# weights, one shared activation block). PyTorch: torch.compile(dynamic=False),
+# one graph per bucket. Both see the same batches in the same order.
 def bucket_of(pair):
     need = max(len(pair[0]), len(pair[1]) + 1)
     return next(L for L in LEN_BUCKETS if L >= need)
 
 
-def bucketed_batches(data, epoch_seed, B=BATCH):
+tgt_tokens = {L: [] for L in LEN_BUCKETS}
+for pair in train_ids:
+    tgt_tokens[bucket_of(pair)].append(len(pair[1]) + 1)
+mean_tokens = np.mean([len(t) + 1 for _, t in train_ids])
+BUCKET_BATCH = {L: max(8, int(round(BATCH * mean_tokens / np.mean(v) / 8)) * 8)
+                for L, v in tgt_tokens.items()}
+print("pairs per batch by bucket:", BUCKET_BATCH, f"(~{BATCH * mean_tokens:.0f} "
+      "target tokens per batch)")
+
+
+def bucketed_batches(data, epoch_seed):
     rng_ = np.random.default_rng(epoch_seed)
     groups = {L: [] for L in LEN_BUCKETS}
     for j in rng_.permutation(len(data)):
         groups[bucket_of(data[j])].append(j)
-    made = [(L, idx[i:i + B]) for L, idx in groups.items()
-            for i in range(0, len(idx) - B + 1, B)]
+    made = [(L, idx[i:i + BUCKET_BATCH[L]]) for L, idx in groups.items()
+            for i in range(0, len(idx) - BUCKET_BATCH[L] + 1, BUCKET_BATCH[L])]
     for k in rng_.permutation(len(made)):
         L, idx = made[k]
         yield to_batch([data[j] for j in idx], L, L)
@@ -589,7 +603,9 @@ def bucketed_stream(n_steps):
 def build_ht_bucketed():
     cpu_model.load_state_dict(init_state)
     t0 = time.perf_counter()
-    step = BucketedTrainStep(cpu_model, BATCH, [(L, L) for L in LEN_BUCKETS],
+    shapes = [(BUCKET_BATCH[L], L, L) for L in LEN_BUCKETS]
+    shapes.append((BATCH, SRC_LEN, TGT_LEN))     # the fixed val batches
+    step = BucketedTrainStep(cpu_model, BATCH, shapes,
                              precision="fp16", max_grad_norm=MAX_GRAD_NORM,
                              seed=SEED, device=HT_GPU, **ADAM)
     drv.synchronize()
@@ -602,11 +618,15 @@ def steady_ms(log):
     return (t1_ - t0_) / (i1 - i0) * 1e3
 
 
-widths = [b[0].shape[1] for b in bucketed_stream(TRAIN_STEPS)]
+stream_stats = [(b[0].shape[1], int((b[2] != PAD).sum()))
+                for b in bucketed_stream(TRAIN_STEPS)]
+widths = [w for w, _ in stream_stats]
 fill_fixed = np.mean([(b[2] != PAD).mean() for b in val_batches])
+bucket_tokens = float(np.mean([n for _, n in stream_stats]))
 print("bucket share of the training batches: " + ", ".join(
     f"{L}: {widths.count(L) / len(widths):.0%}" for L in LEN_BUCKETS)
-    + f"  (fixed 64/64 batches are {fill_fixed:.0%} real target tokens)")
+    + f"; {bucket_tokens:.0f} target tokens per batch (fixed: "
+    f"{bench_tokens:.0f}, {fill_fixed:.0%} of the 64/64 slots)")
 gpu_status("before bucketed training")
 ht_bucket_run = train_ht(build_ht_bucketed, bucketed_stream, "houssem buckets",
                          save=False)
@@ -616,6 +636,8 @@ gpu_status("after bucketed training")
 bucket_runs = {
     "buckets": list(LEN_BUCKETS),
     "share": {str(L): widths.count(L) / len(widths) for L in LEN_BUCKETS},
+    "pairs_per_batch": {str(L): b for L, b in BUCKET_BATCH.items()},
+    "target_tokens_per_batch": bucket_tokens,
     HT: {k: ht_bucket_run[k] for k in ("log", "wall", "val", "setup", "mem_gb")},
     TC: {k: torch_bucket_run[k] for k in ("log", "wall", "val", "mem_gb")},
 }
@@ -811,7 +833,9 @@ for (i, a, _), (_, b, _) in zip(ht_run["log"], torch_run["log"]):
 lines += ["", f"## Length buckets {list(LEN_BUCKETS)}, {TRAIN_STEPS} steps each, "
           "same batches", "",
           "Bucket share: " + ", ".join(f"{L}: {v:.0%}" for L, v in
-                                       bucket_runs["share"].items()), "",
+                                       bucket_runs["share"].items())
+          + f". Pairs per batch: {BUCKET_BATCH}, {bucket_tokens:.0f} target "
+          f"tokens per batch (fixed 64/64: {bench_tokens:.0f}).", "",
           "| engine | wall s | steady ms/step | val loss | fixed 64/64 wall s | "
           "fixed ms/step | fixed val |", "|---|---:|---:|---:|---:|---:|---:|"]
 for name, run_fixed, run_b in ((HT, ht_run, ht_bucket_run),

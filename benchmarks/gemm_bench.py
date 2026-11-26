@@ -1,10 +1,10 @@
 """The training step's matrix multiplies: cuBLAS default vs tuned vs PyTorch.
 
 Profiles one `TrainStep` twice, first with cuBLAS's default algorithm for
-every multiply and then with startup tuning on (`tune_gemms=True`, the
-default), and groups the GPU time by multiply shape. When PyTorch is
-installed it also times every shape with torch.matmul (fp16 output, as under
-autocast), so each row shows where our multiplies stand against PyTorch's.
+every multiply and then with startup tuning on (`tune_gemms=True`), and
+groups the GPU time by multiply shape. When PyTorch is installed it also
+times every shape with torch.matmul (fp16 output, as under autocast), so each
+row shows where our multiplies stand against PyTorch's.
 
 Run from the repository root (needs CuPy and a CUDA GPU; PyTorch optional):
     python benchmarks/gemm_bench.py
