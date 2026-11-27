@@ -964,6 +964,19 @@ class TrainStep:
         self._forward(train=False)
         return float(self.scalars[2:3].numpy()[0])
 
+    def encode(self, src) -> drv.Buffer:
+        """The encoder's output (B·S, d) for a source batch (B, S), without
+        dropout, as used by decoding. The buffer is reused by the next call."""
+        src = np.asarray(src)
+        if src.shape != (self.B, self.S):
+            raise ValueError(f"src must have shape {(self.B, self.S)}, "
+                             f"got {src.shape}")
+        self.src_ids.copy_from(src)
+        self._p_res = self._p_emb = self._p_attn = self._p_ffn = 0.0
+        self._training = False
+        self._fwd_stack(self.enc)
+        return self.enc.h[-1]
+
     def last_loss(self) -> float:
         """Loss of the most recent step (waits for the GPU)."""
         return float(self.scalars[2:3].numpy()[0])

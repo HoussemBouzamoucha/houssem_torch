@@ -1444,3 +1444,115 @@ extern "C" __global__ void adamw(
 #endif
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Decoding (one new target token per sentence per step, key/value cache)
+// ---------------------------------------------------------------------------
+
+// Index and value of each row's largest entry (first one on ties, like
+// numpy.argmax). One block per row.
+extern "C" __global__ void argmax_rows(const T* __restrict__ x, int cols,
+                                       int* __restrict__ out) {
+    __shared__ float s_v[32];
+    __shared__ int s_i[32];
+    const T* row = x + (size_t)blockIdx.x * cols;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        float v = tof(row[c]);
+        if (v > best) { best = v; bi = c; }       // c increases: first max kept
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) { s_v[warp] = best; s_i[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int)(blockDim.x >> 5); ++w)
+            if (s_v[w] > best || (s_v[w] == best && s_i[w] < bi)) {
+                best = s_v[w]; bi = s_i[w];
+            }
+        out[blockIdx.x] = bi == 0x7fffffff ? 0 : bi;
+    }
+}
+
+#if defined(DEC_DK) && defined(DEC_LMAX)
+// One query row against Lk keys, one block per (sentence b, head h):
+//   ctx[b, h] = softmax(scale · q·Kᵀ + mask) · V
+// Element (b, j, col) of K is K[b*kv_bstride + j*kv_rstride + col], same
+// for V; k_bias / v_bias (optional) are added when reading them (cross-
+// attention reads the raw memory projections). Self-attention passes the
+// new token's key and value (k_new / v_new, + bias): they are first stored
+// at row t_new of the cache, which then holds rows 0..Lk-1. key_ids
+// (optional, (B, Lk)) masks keys whose id is `pad` (source padding).
+extern "C" __global__ void decode_attn(
+        const T* __restrict__ q, int q_stride, const T* __restrict__ q_bias,
+        const T* __restrict__ k_new, const T* __restrict__ v_new,
+        int new_stride, const T* __restrict__ k_new_bias,
+        const T* __restrict__ v_new_bias, int t_new,
+        T* K, T* V, int kv_rstride, int kv_bstride,
+        const T* __restrict__ k_bias, const T* __restrict__ v_bias,
+        const int* __restrict__ key_ids, int pad, int Lk,
+        T* __restrict__ ctx, int ctx_stride, int H, float scale) {
+    __shared__ float s_q[DEC_DK];
+    __shared__ float s_p[DEC_LMAX];
+    __shared__ float s_red[32];
+    int b = blockIdx.x / H, h = blockIdx.x % H, tid = threadIdx.x;
+    int col0 = h * DEC_DK;
+    size_t kv0 = (size_t)b * kv_bstride + col0;
+    for (int c = tid; c < DEC_DK; c += blockDim.x) {
+        float qq = tof(q[(size_t)b * q_stride + col0 + c]);
+        if (q_bias) qq = roundT(qq + tof(q_bias[col0 + c]));
+        s_q[c] = qq * scale;
+        if (k_new) {
+            size_t src = (size_t)b * new_stride + col0 + c;
+            size_t dst = kv0 + (size_t)t_new * kv_rstride + c;
+            float kk = tof(k_new[src]), vv = tof(v_new[src]);
+            if (k_new_bias) kk += tof(k_new_bias[col0 + c]);
+            if (v_new_bias) vv += tof(v_new_bias[col0 + c]);
+            K[dst] = fromf(kk);
+            V[dst] = fromf(vv);
+        }
+    }
+    __syncthreads();
+    for (int j = tid; j < Lk; j += blockDim.x) {
+        float s = -INFINITY;
+        if (!(key_ids && key_ids[(size_t)b * Lk + j] == pad)) {
+            const T* kr = K + kv0 + (size_t)j * kv_rstride;
+            s = 0.f;
+#pragma unroll 8
+            for (int c = 0; c < DEC_DK; ++c) {
+                float kk = tof(kr[c]);
+                if (k_bias) kk = roundT(kk + tof(k_bias[col0 + c]));
+                s += s_q[c] * kk;
+            }
+        }
+        s_p[j] = s;
+    }
+    float m = -INFINITY;
+    for (int j = tid; j < Lk; j += blockDim.x) m = fmaxf(m, s_p[j]);
+    m = block_max(m, s_red);
+    float sum = 0.f;
+    for (int j = tid; j < Lk; j += blockDim.x) {
+        float e = s_p[j] == -INFINITY ? 0.f : __expf(s_p[j] - m);
+        s_p[j] = e;
+        sum += e;
+    }
+    sum = block_sum(sum, s_red);          // ends with __syncthreads: s_p ready
+    float inv = sum > 0.f ? 1.f / sum : 0.f;
+    for (int c = tid; c < DEC_DK; c += blockDim.x) {
+        float vb = v_bias ? tof(v_bias[col0 + c]) : 0.f;
+        float acc = 0.f;
+        for (int j = 0; j < Lk; ++j) {
+            float vv = tof(V[kv0 + (size_t)j * kv_rstride + c]);
+            if (v_bias) vv = roundT(vv + vb);
+            acc += s_p[j] * vv;
+        }
+        ctx[(size_t)b * ctx_stride + col0 + c] = fromf(acc * inv);
+    }
+}
+#endif  // DEC_DK && DEC_LMAX
