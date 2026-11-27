@@ -320,3 +320,90 @@ def test_buckets_share_one_activation_block():
     for k in ref:
         np.testing.assert_allclose(got[k], ref[k], rtol=1e-5, atol=1e-6,
                                    err_msg=k)
+
+
+@pytest.mark.parametrize("mode", ["drelu_bgrad", "drelu_wgrad"])
+def test_fused_ffn_epilogue_matches_kernels(mode):
+    """FFN backward through cuBLASLt (ReLU + dropout mask in the multiply,
+    bias gradient from an epilogue) against the plain act_bwd kernel, same
+    dropout masks."""
+    if not driver.lt_available():
+        pytest.skip("cuBLASLt not loadable")
+    cfg = small_config(d_ff=128, dropout=0.1)          # relu, d_ff % 128 == 0
+    _, fused = build(cfg, precision="fp16", fused_epilogues=mode)
+    _, plain = build(cfg, precision="fp16")
+    assert fused.lt_ffn == mode and plain.lt_ffn is None
+    assert not fused.grad.numpy().any()               # the probe left nothing
+    src, tgt_in, tgt_out = batch(cfg)
+    for step in (fused, plain):
+        step.forward_backward(src, tgt_in, tgt_out)
+    assert fused.last_loss() == pytest.approx(plain.last_loss(), rel=1e-3)
+    a, b = fused.gradients(), plain.gradients()
+    assert_grads_close(a, b, 2e-2)
+    for name in a:
+        if name.endswith("up.bias"):
+            assert np.abs(b[name]).max() > 0, name     # the check means something
+
+
+def stacked(*batches):
+    return tuple(np.concatenate(parts) for parts in zip(*batches))
+
+
+def build_rows(cfg, rows, precision="fp32"):
+    from houssem_torch.backends.cuda.train_step import TrainStep
+    ht.manual_seed(0)
+    return TrainStep(Transformer(cfg), rows, S, T, precision=precision)
+
+
+@pytest.mark.parametrize("precision", ["fp32", "fp16"])
+def test_accumulated_micro_batches_match_one_big_batch(precision):
+    """Two micro-batches of B rows accumulated = one batch of 2B rows: same
+    loss, gradients and AdamW update (dropout off)."""
+    cfg = small_config(attention_bias=False)
+    m1, m2 = batch(cfg, 0), short_batch(cfg, 1)     # different token counts
+    _, acc = build(cfg, precision=precision)
+    big = build_rows(cfg, 2 * B, precision)
+    acc.forward_backward(*m1, tokens=None)
+    single = acc.last_loss()
+    from houssem_torch.backends.cuda.train_step import target_tokens
+    total = target_tokens(m1[2], cfg.pad_id) + target_tokens(m2[2], cfg.pad_id)
+    acc.forward_backward(*m1, tokens=total)
+    acc.forward_backward(*m2, accumulate=True, tokens=total)
+    big.forward_backward(*stacked(m1, m2))
+    half = precision == "fp16"
+    assert acc.last_loss() == pytest.approx(big.last_loss(),
+                                            rel=2e-3 if half else 1e-5)
+    assert acc.last_loss() != pytest.approx(single, rel=1e-3)
+    assert_grads_close(acc.gradients(), big.gradients(), 2e-2 if half else 1e-4)
+    if half:
+        return
+    for _ in range(3):
+        acc.accumulate_step([m1, m2], lr=3e-3)
+        big(*stacked(m1, m2), lr=3e-3)
+    # Two accumulated multiplies sum in another order than one: last-bit
+    # gradient differences, which AdamW's 1/sqrt(v) magnifies where the
+    # gradient is near zero (seen on T4: 1 of 12288 weights off by 1.8e-5).
+    got, ref = acc.state_dict(), big.state_dict()
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-4,
+                                   err_msg=k)
+
+
+def test_accumulation_across_buckets():
+    """Micro-batches in different buckets accumulate into one update equal
+    to the full-width big batch."""
+    cfg = small_config(attention_bias=False)
+    m1, m2 = short_batch(cfg, 0), batch(cfg, 1)
+    step = bucketed(cfg, [(4, 3), (S, T)], precision="fp32")
+    big = build_rows(cfg, 2 * B)
+    for _ in range(2):
+        step.accumulate_step([m1, m2], lr=3e-3)
+        big(*stacked(m1, m2), lr=3e-3)
+    assert step.counts == {(B, 4, 3): 2, (B, S, T): 2}
+    assert step.last_loss() == pytest.approx(big.last_loss(), rel=1e-5)
+    got, ref = step.state_dict(), big.state_dict()
+    for k in ref:
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-5,
+                                   err_msg=k)
+    with pytest.raises(ValueError):
+        step.accumulate_step([], lr=3e-3)

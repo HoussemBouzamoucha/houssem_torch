@@ -1086,6 +1086,86 @@
    },
    "setup": "Token-budget buckets 16/32/48/64; scale 1 = 1493 target tokens/step (one 64-pair batch). Same init, data order, Noam warmup 2000 for every scale. Engine order alternated per scale. Validation time excluded. torch.compile(dynamic=False) wall includes compiling 4 bucket graphs per scale (~8 s at x1 with a warm cache, ~125 s at x2 and x4).",
    "notes": "Steady speedup 1.28x / 1.22x / 1.20x at x1/x2/x4: flattens toward ~1.2x as matmuls (cuBLAS in both) take a bigger share. Val curves of the two engines agree within ~0.01-0.05 at every point. x4 val rises after step 5000 (3.575 -> 3.601, both engines): ~13 passes over opus_books' ~2.7M target tokens, i.e. overfitting the small dataset, not a batch-size problem. At larger scales houssem_torch uses less memory than torch.compile (3.61 vs 4.24 GB at x4)."
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "94242c6",
+   "branch": "gpu/faster-gemms",
+   "script": "benchmarks/gemm_bench.py --device 1",
+   "kind": "isolated matmul timing per training-step multiply (median 7x20, variants interleaved)",
+   "matmul_us_per_step": {
+    "64": {
+     "ours": 58343,
+     "ours_alt_layout": 58736,
+     "ours_fp16_wgrad": 56857,
+     "torch": 56879,
+     "torch_alt_layout": 57207,
+     "best_ours": 56525
+    },
+    "256": {
+     "ours": 234939,
+     "ours_alt_layout": 239343,
+     "ours_fp16_wgrad": 231869,
+     "torch": 231066,
+     "torch_alt_layout": 235743,
+     "best_ours": 231414
+    }
+   },
+   "conclusion": "Matmuls at parity with torch.matmul; (out,in) weight layout no gain; only difference is fp32+C weight-grad output (1.3-2.5% of matmul time). Write-up: benchmarks/t4/2026-11-27_kaggle_t4_gemm_layouts.md"
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "84422d1",
+   "branch": "gpu/faster-gemms",
+   "tests_on_t4": "63 passed",
+   "script": "benchmarks/epilogue_bench.py --device 1",
+   "kind": "FFN backward: plain vs cuBLASLt drelu_bgrad vs drelu_wgrad, same step, modes alternating",
+   "step_ms": {
+    "64": {
+     "plain": 79.3,
+     "drelu_bgrad": 81.3,
+     "drelu_wgrad": 81.8
+    },
+    "256": {
+     "plain": 289.9,
+     "drelu_bgrad": 296.3,
+     "drelu_wgrad": 303.2
+    }
+   },
+   "conclusion": "cuBLASLt epilogue kernels on Turing are 1.35-2.5x slower than plain cuBLAS per multiply (autotuned over 8 candidates); fused epilogues off by default. Write-up: benchmarks/t4/2026-11-27_kaggle_t4_lt_epilogues.md"
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "5854b5f",
+   "branch": "gpu/faster-gemms",
+   "tests_on_t4": "65 passed, 1 failed (AdamW-amplified rounding, tolerance loosened)",
+   "script": "benchmarks/accum_bench.py --device 1 --micro 64 --k 4",
+   "kind": "gradient accumulation 4x64 vs one 256-row batch",
+   "step_ms": {
+    "4x64_accumulated": 293.9,
+    "1x256": 277.0
+   },
+   "memory_gb": {
+    "4x64_accumulated": 2.18,
+    "1x256": 5.88
+   },
+   "conclusion": "Same update with 37% of the memory for 6% more time. Write-up: benchmarks/t4/2026-11-27_kaggle_t4_grad_accumulation.md"
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "5d7e79a",
+   "branch": "gpu/faster-gemms",
+   "tests_on_t4": "66 passed",
+   "script": "benchmarks/accum_bench.py --device 1 --micro 64 --k 4",
+   "kind": "re-run after the tolerance fix",
+   "step_ms": {
+    "4x64_accumulated": 293.3,
+    "1x256": 275.1
+   },
+   "memory_gb": {
+    "4x64_accumulated": 2.18,
+    "1x256": 5.88
+   }
   }
  ]
 }

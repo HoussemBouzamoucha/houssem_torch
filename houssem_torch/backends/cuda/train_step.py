@@ -49,6 +49,8 @@ from houssem_torch.models.transformer import (Transformer,
 
 _SOURCE = Path(__file__).with_name("kernels.cu").read_text(encoding="utf-8")
 _THREADS = 256
+# cuBLASLt ways to run the FFN backward (TrainStep(fused_epilogues=...)).
+FFN_EPILOGUES = ("drelu_bgrad", "drelu_wgrad")
 _ALIGN = 64          # parameter offsets, in elements (128 B in fp16)
 _LN_EPS = 1e-5       # houssem_torch.nn.LayerNorm default
 _ATT_WARPS = 4       # warps per fused-attention forward block
@@ -139,6 +141,7 @@ class TrainStep:
                  seed: int = 0, init_scale: float = 2.0 ** 16,
                  growth_interval: int = 2000, device: int = 0,
                  fused_attention: bool = True, tune_gemms: bool = False,
+                 fused_epilogues: bool | str = False,
                  _shared: TrainStep | None = None,
                  _arena: drv.Arena | None = None):
         if not drv.is_available():
@@ -161,7 +164,8 @@ class TrainStep:
                              init_scale=init_scale,
                              growth_interval=growth_interval, device=device,
                              fused_attention=fused_attention,
-                             tune_gemms=tune_gemms)
+                             tune_gemms=tune_gemms,
+                             fused_epilogues=fused_epilogues)
         self.cfg = cfg
         self.B, self.S, self.T = batch_size, src_len, tgt_len
         self.precision = precision
@@ -173,6 +177,13 @@ class TrainStep:
         self.max_grad_norm = max_grad_norm
         self.growth_interval = growth_interval
         self.fused_attention = bool(fused_attention)
+        if fused_epilogues is True:
+            fused_epilogues = "drelu_wgrad"
+        if fused_epilogues not in (False, None) + FFN_EPILOGUES:
+            raise ValueError(f"fused_epilogues must be False or one of "
+                             f"{FFN_EPILOGUES}, got {fused_epilogues!r}")
+        self.fused_epilogues = fused_epilogues or None
+        self._training = False
         self.d = cfg.d_model
         self.H = cfg.n_heads
         self.dk = cfg.d_model // cfg.n_heads
@@ -189,6 +200,8 @@ class TrainStep:
             self._share_parameters(_shared)
         self._compile()
         self._build_plan()
+        if self.lt_ffn:
+            self.lt_ffn = self._probe_lt_ffn(self.lt_ffn)
 
         if _shared is None:
             self.scalars = drv.zeros(10, np.float32)
@@ -296,6 +309,14 @@ class TrainStep:
         self.evw = evw
         self.k_bias_act = self._kernel("bias_act_fwd", ACT=act, EVW=evw)
         self.k_act_bwd = self._kernel("act_bwd", ACT=act, EVW=evw)
+        # FFN backward through cuBLASLt (ReLU gradient, dropout mask and bias
+        # gradient fused into the g_y·W_downᵀ multiply): fp16 ReLU only.
+        ok = (half and act == 0 and evw == 8 and cfg.d_ff % 128 == 0
+              and self.fused_epilogues is not None and drv.lt_available())
+        self.lt_ffn = self.fused_epilogues if ok else None
+        if self.lt_ffn:
+            self.k_add_f32 = self._kernel("add_into_f32", ACT=act, EVW=evw)
+            self.k_acc_f32 = self._kernel("acc_f32", ACT=act, EVW=evw)
         self.k_split = self._kernel("split_heads")
         self.k_merge = self._kernel("merge_heads")
         # Attention: fused kernels per (queries, keys, causal) where they fit,
@@ -445,6 +466,51 @@ class TrainStep:
         else:
             dff = self.cfg.d_ff
             sub.bufs.update(u=z(st.M, dff), a=z(st.M, dff))
+            if self.lt_ffn:
+                sub.bufs["mask"] = self._act(st.M * dff // 32, np.int32)
+
+    def _probe_lt_ffn(self, mode):
+        """Plan (and time) the fused FFN-backward multiplies once per stack
+        shape; None (plain kernels) if cuBLASLt refuses them. The gradient
+        buffers are used as scratch, so zero them afterwards."""
+        self._p_ffn = 0.0
+        try:
+            for st in (self.enc, self.dec):
+                sub = next(s for s in st.subs if s.kind == "ffn")
+                self._ffn_bwd_lt(st, sub, st.x[0], st.h[0], mode)
+            drv.synchronize()
+            self.grad.fill_(0.0)
+            return mode
+        except (RuntimeError, StopIteration) as exc:
+            import warnings
+            warnings.warn(f"fused FFN epilogue disabled: {exc}")
+            self.grad.fill_(0.0)
+            return None
+
+    def _ffn_bwd_lt(self, st, sub, g_y, h, mode):
+        """g_u = mask ⊙ g_y·W_downᵀ / (1-p) through cuBLASLt (mask = a != 0
+        covers ReLU and dropout), the up-projection's weight gradient, and
+        its bias gradient from one of the two multiplies' epilogues."""
+        W, G, dff, pre = self.W, self.G, self.cfg.d_ff, sub.prefix
+        g_a = self._buf(f"{st.name}.ga", (st.M, dff))
+        alpha = 1.0 / (1.0 - self._p_ffn)
+        grid = -(-dff // _THREADS)
+        if mode == "drelu_bgrad":     # bias gradient (fp16) from g_u's multiply
+            db = self._buf("ffn.db", (dff,))
+            drv.gemm_epilogue(g_y, W[f"{pre}.down.weight"], g_a,
+                              epilogue="drelu_bgrad", bias=db,
+                              aux=sub.bufs["mask"], trans_b=True, alpha=alpha)
+            self.k_add_f32(grid, _THREADS, db, G[f"{pre}.up.bias"], dff)
+            drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
+        else:                         # bias gradient (fp32) from dW's multiply
+            drv.gemm_epilogue(g_y, W[f"{pre}.down.weight"], g_a,
+                              epilogue="drelu", aux=sub.bufs["mask"],
+                              trans_b=True, alpha=alpha)
+            db = self._buf("ffn.db32", (dff,), np.float32)
+            drv.gemm_epilogue(h, g_a, G[f"{pre}.up.weight"], epilogue="bgrad_b",
+                              bias=db, trans_a=True, beta=1.0)
+            self.k_acc_f32(grid, _THREADS, db, G[f"{pre}.up.bias"], dff)
+        return g_a
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -487,6 +553,7 @@ class TrainStep:
         cfg = self.cfg
         self._p_res = self._p_emb = self._p_attn = float(cfg.dropout) if train else 0.0
         self._p_ffn = float(cfg.ffn_dropout_rate) if train else 0.0
+        self._training = train
         with drv.region("fwd"):
             self._fwd_stack(self.enc)
             self._fwd_stack(self.dec)
@@ -549,8 +616,9 @@ class TrainStep:
             u, a = sub.bufs["u"], sub.bufs["a"]
             drv.gemm(h, W[f"{pre}.up.weight"], u)
             blocks, threads, rpb = self._ffn_grid(M, self.cfg.d_ff)
-            self.k_bias_act(blocks, threads, u, W[f"{pre}.up.bias"], a, M,
-                            self.cfg.d_ff, rpb, self._seed(sub.inner_seed),
+            mask = sub.bufs.get("mask") if self._training else None
+            self.k_bias_act(blocks, threads, u, W[f"{pre}.up.bias"], a, mask,
+                            M, self.cfg.d_ff, rpb, self._seed(sub.inner_seed),
                             self._p_ffn)
             drv.gemm(a, W[f"{pre}.down.weight"], y)
             return y
@@ -738,13 +806,16 @@ class TrainStep:
             dff = self.cfg.d_ff
             drv.gemm(sub.bufs["a"], g_y, G[f"{pre}.down.weight"], trans_a=True,
                      beta=1.0)
-            g_a = self._buf(f"{st.name}.ga", (M, dff))
-            drv.gemm(g_y, W[f"{pre}.down.weight"], g_a, trans_b=True)
-            blocks, threads, rpb = self._ffn_grid(M, dff)
-            self.k_act_bwd(blocks, threads, g_a, sub.bufs["u"],
-                           G[f"{pre}.up.bias"], M, dff, rpb,
-                           self._seed(sub.inner_seed), self._p_ffn)
-            drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
+            if self.lt_ffn:
+                g_a = self._ffn_bwd_lt(st, sub, g_y, h, self.lt_ffn)
+            else:
+                g_a = self._buf(f"{st.name}.ga", (M, dff))
+                drv.gemm(g_y, W[f"{pre}.down.weight"], g_a, trans_b=True)
+                blocks, threads, rpb = self._ffn_grid(M, dff)
+                self.k_act_bwd(blocks, threads, g_a, sub.bufs["u"],
+                               G[f"{pre}.up.bias"], M, dff, rpb,
+                               self._seed(sub.inner_seed), self._p_ffn)
+                drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
             drv.gemm(g_a, W[f"{pre}.up.weight"], g_h, trans_b=True)
             return g_h
 
@@ -829,16 +900,30 @@ class TrainStep:
             buf.copy_from_async(h)
         self._stage_done[slot].record()
         self._stage_used[slot] = True
-        self._count = max(int((tgt_out != self.cfg.pad_id).sum()), 1)
+        self._count = target_tokens(tgt_out, self.cfg.pad_id)
 
-    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True) -> None:
-        """Loss and gradients for one batch (no parameter update)."""
+    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True, *,
+                         accumulate: bool = False,
+                         tokens: int | None = None) -> None:
+        """Loss and gradients for one batch (no parameter update).
+
+        accumulate: add to the gradients and loss already held (the second
+            and later micro-batches of one optimizer step) instead of
+            starting from zero.
+        tokens: the loss is the sum over target tokens divided by this
+            (default: this batch's own target tokens). For accumulation pass
+            the target tokens of all the micro-batches together, so the sum
+            is the mean over the whole batch. See `accumulate_step`.
+        """
         self._load_batch(src, tgt_in, tgt_out)
+        if tokens is not None:
+            self._count = max(int(tokens), 1)
         self._seeds = self._rng.integers(0, 2 ** 32, size=self._n_seeds,
                                          dtype=np.uint32)
-        with drv.region("optimizer"):
-            self.grad.fill_(0)
-            self.k_reset(1, 1, self.scalars)
+        if not accumulate:
+            with drv.region("optimizer"):
+                self.grad.fill_(0)
+                self.k_reset(1, 1, self.scalars)
         self._forward(train)
         self._backward()
 
@@ -862,6 +947,15 @@ class TrainStep:
         """One training step. Queued on the GPU: returns without waiting."""
         self.forward_backward(src, tgt_in, tgt_out, train=True)
         self.update(lr)
+
+    def accumulate_step(self, micro_batches, lr: float) -> None:
+        """One optimizer step over several micro-batches (gradient
+        accumulation): the same update as one batch holding all their rows,
+        with the activation memory of one micro-batch.
+
+            step.accumulate_step([(src, tgt_in, tgt_out), ...], lr)
+        """
+        accumulate_step(self, micro_batches, lr, self.cfg.pad_id)
 
     def evaluate(self, src, tgt_in, tgt_out) -> float:
         """Loss without dropout and without updating anything (waits)."""
@@ -897,6 +991,24 @@ class TrainStep:
     def memory_bytes(self) -> int:
         """Device memory held by this step's buffers."""
         return drv.memory_in_use()
+
+
+def target_tokens(tgt_out, pad) -> int:
+    """Non-padding target tokens (the loss normaliser), at least 1."""
+    return max(int((np.asarray(tgt_out) != pad).sum()), 1)
+
+
+def accumulate_step(step, micro_batches, lr, pad) -> None:
+    """Gradient accumulation for TrainStep and BucketedTrainStep: forward
+    and backward every micro-batch into the same gradients, each loss term
+    divided by the target tokens of all of them, then one update."""
+    micro_batches = [tuple(b) for b in micro_batches]
+    if not micro_batches:
+        raise ValueError("accumulate_step needs at least one micro-batch")
+    total = sum(target_tokens(b[2], pad) for b in micro_batches)
+    for i, b in enumerate(micro_batches):
+        step.forward_backward(*b, train=True, accumulate=i > 0, tokens=total)
+    step.update(lr)
 
 
 def _used_width(a, pad):
@@ -1000,10 +1112,17 @@ class BucketedTrainStep:
                        _fit_width(tgt_in, T, self.pad),
                        _fit_width(tgt_out, T, self.pad))
 
-    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True) -> None:
+    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True, *,
+                         accumulate: bool = False,
+                         tokens: int | None = None) -> None:
+        """See TrainStep.forward_backward. Micro-batches of one accumulated
+        step may fall in different buckets: all buckets share the
+        gradients."""
         shape, batch = self._route(src, tgt_in, tgt_out)
         self.counts[shape] += 1
-        self.steps[shape].forward_backward(*batch, train=train)
+        self.steps[shape].forward_backward(*batch, train=train,
+                                           accumulate=accumulate,
+                                           tokens=tokens)
 
     def update(self, lr: float) -> None:
         self.main.update(lr)
@@ -1012,6 +1131,11 @@ class BucketedTrainStep:
         """One training step on the batch's bucket (queued, does not wait)."""
         self.forward_backward(src, tgt_in, tgt_out, train=True)
         self.update(lr)
+
+    def accumulate_step(self, micro_batches, lr: float) -> None:
+        """One optimizer step over several micro-batches, each on its own
+        bucket (see TrainStep.accumulate_step)."""
+        accumulate_step(self, micro_batches, lr, self.pad)
 
     def evaluate(self, src, tgt_in, tgt_out) -> float:
         shape, batch = self._route(src, tgt_in, tgt_out)

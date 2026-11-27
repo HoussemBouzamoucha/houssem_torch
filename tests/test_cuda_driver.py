@@ -166,3 +166,125 @@ def test_arena_measures_and_shares_one_block():
     one.take(5, np.float32)
     with pytest.raises(MemoryError):
         one.take(1, np.float32)
+
+
+# cuBLASLt fused epilogues -------------------------------------------------
+
+needs_lt = pytest.mark.skipif(not driver.lt_available(),
+                              reason="cuBLASLt not loadable")
+
+
+def pack_mask(on):
+    """Row-major, least-significant-bit-first bit mask as int32 words."""
+    bits = np.packbits(on.astype(np.uint8).reshape(-1), bitorder="little")
+    return bits.view(np.int32)
+
+
+def fp16_operands(m, n, k, trans_b=False):
+    a = rng.standard_normal((m, k)).astype(np.float16)
+    b = (rng.standard_normal((n, k) if trans_b else (k, n))
+         / np.sqrt(k)).astype(np.float16)
+    ref = a.astype(np.float32) @ (b.T if trans_b else b).astype(np.float32)
+    return a, b, ref
+
+
+@needs_lt
+def test_lt_bias_epilogues():
+    m, n, k = 40, 256, 64
+    a, b, ref = fp16_operands(m, n, k)
+    bias = rng.standard_normal(n).astype(np.float16)
+    for epi, want in (("default", ref), ("bias", ref + bias),
+                      ("relu_bias", np.maximum(ref + bias, 0))):
+        c = driver.empty((m, n), np.float16)
+        driver.gemm_epilogue(driver.from_numpy(a), driver.from_numpy(b), c,
+                             epilogue=epi,
+                             bias=driver.from_numpy(bias) if epi != "default"
+                             else None)
+        np.testing.assert_allclose(c.numpy().astype(np.float32), want,
+                                   rtol=1e-2, atol=1e-2, err_msg=epi)
+
+
+@needs_lt
+def test_lt_relu_mask_layout_is_row_major_lsb_first():
+    """The bit order our forward kernel writes must be the one cuBLASLt
+    uses: let cuBLASLt write a ReLU mask and compare."""
+    m, n, k = 24, 384, 64
+    a, b, ref = fp16_operands(m, n, k)
+    bias = rng.standard_normal(n).astype(np.float16)
+    c = driver.empty((m, n), np.float16)
+    aux = driver.zeros(m * n // 32, np.int32)
+    driver.gemm_epilogue(driver.from_numpy(a), driver.from_numpy(b), c,
+                         epilogue="relu_aux_bias",
+                         bias=driver.from_numpy(bias), aux=aux)
+    got = aux.numpy()
+    on = c.numpy() > 0
+    candidates = {
+        "row-major lsb-first": pack_mask(on),
+        "row-major msb-first": np.packbits(on.reshape(-1)).view(np.int32),
+        "column-major lsb-first": pack_mask(on.T.copy()),
+    }
+    matches = [k for k, v in candidates.items() if np.array_equal(v, got)]
+    assert matches == ["row-major lsb-first"], (
+        f"mask layout matches {matches}; first words "
+        f"{[hex(x & 0xffffffff) for x in got[:4]]} vs on[0,:32]="
+        f"{on[0, :32].astype(int).tolist()}")
+
+
+@needs_lt
+@pytest.mark.parametrize("trans_b", [False, True])
+def test_lt_drelu_bgrad(trans_b):
+    """c = alpha·(a@b) ⊙ mask, bias = column sums of c."""
+    m, n, k = 48, 256, 64
+    a, b, ref = fp16_operands(m, n, k, trans_b)
+    on = rng.random((m, n)) < 0.6
+    c = driver.empty((m, n), np.float16)
+    db = driver.empty(n, np.float16)
+    alpha = 1.0 / 0.9
+    driver.gemm_epilogue(driver.from_numpy(a), driver.from_numpy(b), c,
+                         epilogue="drelu_bgrad", bias=db,
+                         aux=driver.from_numpy(pack_mask(on)),
+                         trans_b=trans_b, alpha=alpha)
+    want = alpha * ref * on
+    np.testing.assert_allclose(c.numpy().astype(np.float32), want,
+                               rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(db.numpy().astype(np.float32), want.sum(0),
+                               rtol=2e-2, atol=5e-2)
+
+
+@needs_lt
+def test_lt_bias_gradient_epilogues():
+    """bgrad_b: column sums of op(b); bgrad_a: row sums of op(a); fp32
+    output accumulated with beta (the weight-gradient multiply)."""
+    m, n, k = 64, 256, 96
+    a = rng.standard_normal((k, m)).astype(np.float16)       # used as aᵀ
+    b = rng.standard_normal((k, n)).astype(np.float16)
+    c0 = rng.standard_normal((m, n)).astype(np.float32)
+    ref = a.astype(np.float32).T @ b.astype(np.float32) + c0
+    for epi, want in (("bgrad_b", b.astype(np.float32).sum(0)),
+                      ("bgrad_a", a.astype(np.float32).sum(0))):
+        c = driver.from_numpy(c0)
+        db = driver.empty(want.size, np.float32)
+        driver.gemm_epilogue(driver.from_numpy(a), driver.from_numpy(b), c,
+                             epilogue=epi, bias=db, trans_a=True, beta=1.0)
+        np.testing.assert_allclose(c.numpy(), ref, rtol=1e-2, atol=5e-2,
+                                   err_msg=epi)
+        np.testing.assert_allclose(db.numpy(), want, rtol=1e-3, atol=1e-2,
+                                   err_msg=epi)
+    assert driver.lt_algorithms()
+
+
+@needs_lt
+def test_lt_epilogue_argument_errors():
+    a, b = driver.zeros((8, 16), np.float16), driver.zeros((16, 128), np.float16)
+    c = driver.empty((8, 128), np.float16)
+    with pytest.raises(ValueError):
+        driver.gemm_epilogue(a, b, c, epilogue="bias")          # no bias
+    with pytest.raises(ValueError):
+        driver.gemm_epilogue(a, b, c, epilogue="drelu_bgrad",
+                             bias=driver.empty(128, np.float16))  # no mask
+    with pytest.raises(ValueError):
+        driver.gemm_epilogue(a, b, c, epilogue="nope")
+    with pytest.raises(TypeError):
+        driver.gemm_epilogue(a, b, c, epilogue="drelu_bgrad",
+                             bias=driver.empty(128, np.float32),
+                             aux=driver.zeros(8 * 128 // 32, np.int32))

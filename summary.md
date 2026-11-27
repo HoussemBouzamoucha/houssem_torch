@@ -1,6 +1,6 @@
 # houssem_torch GPU engine: summary
 
-*As of 2026-11-26, after that day's T4 run. Hardware: Kaggle Tesla T4. Model: transformer_base (52.5M parameters), fp16, batch 64 × 64/64 tokens.*
+*As of 2026-11-27, after that day's T4 runs. Hardware: Kaggle Tesla T4. Model: transformer_base (52.5M parameters), fp16, batch 64 × 64/64 tokens.*
 
 ## What was built
 
@@ -46,11 +46,22 @@ houssem_torch stays faster at every size, but the steady gain levels off at abou
 because cuBLAS matmuls (the same in both engines) dominate big batches. The two
 engines' val losses match at every size. ×4 overfits opus_books after step 5000 (~13 passes over the data).
 
-**Next:** faster matmuls (the only lever left at big batches), a larger
-dataset for long ×4 runs, gradient accumulation.
+## Latest (branch `gpu/faster-gemms`, Kaggle T4 runs 2026-11-27)
+
+| Decision | Why | Outcome |
+|---|---|---|
+| **Time each matmul in isolation**, ours and torch.matmul back to back in the same round (`gemm_bench.py`). | The earlier "matmuls ~10% slower" came from timing the two engines at different moments. | **Our matmuls match PyTorch's** (58.3 vs 56.9 ms/step at batch 64). The only difference is that we write weight gradients in fp32 and accumulate them in place. Storing weights as (out, in) like `nn.Linear` gains nothing. The speedup levels off at big batches because both engines run the same cuBLAS kernels, which take a growing share of the step. Our matmuls are not slower. |
+| **cuBLASLt epilogues** (ctypes binding, since CuPy has none). The FFN backward's ReLU + dropout mask + bias gradient are fused into the multiply, and a 1-bit mask is written by the forward kernel. | Remove the separate `act_bwd` pass over the M×d_ff gradient. | **Correct, but slower on the T4.** On Turing the epilogue kernels run 1.35–2.5× slower than plain cuBLAS, even after timing 8 algorithms per shape, so the step is 2–4% slower. Off by default (`fused_epilogues=False`). Kept for newer GPUs. |
+| **Gradient accumulation** (`accumulate_step(micro_batches, lr)`). Every micro-batch's loss is divided by the target tokens of all of them, followed by one update. Works across buckets. | Batch size was limited by GPU memory. | 4×64 gives the same update as 1×256 (66/66 GPU tests, checked against one big batch) with **2.18 vs 5.88 GB** for **+6% time** (293 vs 275 ms/step). |
+
+Write-ups: `benchmarks/t4/2026-11-27_kaggle_t4_gemm_layouts.md`, `…_lt_epilogues.md`,
+`…_grad_accumulation.md`. On the T4, the engine's speed work is essentially done.
+
+**Next:** training quality: a larger dataset for long big-batch runs, and a
+learning-rate schedule for large effective batches.
 
 ## Known limits
 
 - The fused attention kernels only handle sequences up to about 64 tokens. Longer sequences and fp32 fall back to the unfused path.
 - Only pre-norm is supported; post-norm isn't written.
-- No gradient accumulation yet: one update per batch, so the batch size is limited by GPU memory.
+- cuBLASLt epilogues are slower than plain cuBLAS on Turing, so they're off. Newer GPUs may change that.

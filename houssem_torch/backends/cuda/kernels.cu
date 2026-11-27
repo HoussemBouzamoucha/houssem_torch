@@ -409,8 +409,12 @@ __device__ __forceinline__ float act_grad(float x) {
 // Row-blocked: thread i owns columns [i*EVW, i*EVW + EVW) (blockDim.x =
 // cols / EVW), block b owns rows [b*rpb, (b+1)*rpb).
 //   u += bias (kept for backward);  a = dropout(act(u)).
+// mask (optional, EVW == 8): one bit per element of a, set where a != 0
+// (ReLU active and kept by dropout), row-major, least significant bit
+// first: the aux input of cuBLASLt's DRELU_BGRAD epilogue.
 extern "C" __global__ void bias_act_fwd(
         T* __restrict__ u, const T* __restrict__ bias, T* __restrict__ a,
+        unsigned char* __restrict__ mask,
         int rows, int cols, int rpb, unsigned seed, float p) {
     int c = threadIdx.x * EVW;
     if (c >= cols) return;
@@ -428,7 +432,31 @@ extern "C" __global__ void bias_act_fwd(
         }
         store_vec<EVW>(u + i, uu);
         store_vec<EVW>(a + i, aa);
+#if EVW == 8
+        if (mask) {
+            unsigned bits = 0;
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+                bits |= (roundT(aa[e]) != 0.f ? 1u : 0u) << e;
+            mask[i >> 3] = (unsigned char)bits;
+        }
+#endif
     }
+}
+
+// dst (fp32) += src, n entries: a bias gradient from cuBLASLt (written in
+// the output's fp16) into the fp32 gradient buffer.
+extern "C" __global__ void add_into_f32(const T* __restrict__ src,
+                                        float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += tof(src[i]);
+}
+
+// dst += src, both fp32 (a bias gradient written by cuBLASLt in fp32).
+extern "C" __global__ void acc_f32(const float* __restrict__ src,
+                                   float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
 }
 
 // g (grad of a) -> grad of u, in place: g * dropout_mask * act'(u), and
