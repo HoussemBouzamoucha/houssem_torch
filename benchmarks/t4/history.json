@@ -1112,6 +1112,27 @@
     }
    },
    "conclusion": "Matmuls at parity with torch.matmul; (out,in) weight layout no gain; only difference is fp32+C weight-grad output (1.3-2.5% of matmul time). Write-up: benchmarks/t4/2026-11-27_kaggle_t4_gemm_layouts.md"
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "84422d1",
+   "branch": "gpu/faster-gemms",
+   "tests_on_t4": "63 passed",
+   "script": "benchmarks/epilogue_bench.py --device 1",
+   "kind": "FFN backward: plain vs cuBLASLt drelu_bgrad vs drelu_wgrad, same step, modes alternating",
+   "step_ms": {
+    "64": {
+     "plain": 79.3,
+     "drelu_bgrad": 81.3,
+     "drelu_wgrad": 81.8
+    },
+    "256": {
+     "plain": 289.9,
+     "drelu_bgrad": 296.3,
+     "drelu_wgrad": 303.2
+    }
+   },
+   "conclusion": "cuBLASLt epilogue kernels on Turing are 1.35-2.5x slower than plain cuBLAS per multiply (autotuned over 8 candidates); fused epilogues off by default. Write-up: benchmarks/t4/2026-11-27_kaggle_t4_lt_epilogues.md"
   }
  ]
 }
