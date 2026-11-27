@@ -49,6 +49,8 @@ from houssem_torch.models.transformer import (Transformer,
 
 _SOURCE = Path(__file__).with_name("kernels.cu").read_text(encoding="utf-8")
 _THREADS = 256
+# cuBLASLt ways to run the FFN backward (TrainStep(fused_epilogues=...)).
+FFN_EPILOGUES = ("drelu_bgrad", "drelu_wgrad")
 _ALIGN = 64          # parameter offsets, in elements (128 B in fp16)
 _LN_EPS = 1e-5       # houssem_torch.nn.LayerNorm default
 _ATT_WARPS = 4       # warps per fused-attention forward block
@@ -139,7 +141,7 @@ class TrainStep:
                  seed: int = 0, init_scale: float = 2.0 ** 16,
                  growth_interval: int = 2000, device: int = 0,
                  fused_attention: bool = True, tune_gemms: bool = False,
-                 fused_epilogues: bool = True,
+                 fused_epilogues: bool | str = False,
                  _shared: TrainStep | None = None,
                  _arena: drv.Arena | None = None):
         if not drv.is_available():
@@ -175,7 +177,12 @@ class TrainStep:
         self.max_grad_norm = max_grad_norm
         self.growth_interval = growth_interval
         self.fused_attention = bool(fused_attention)
-        self.fused_epilogues = bool(fused_epilogues)
+        if fused_epilogues is True:
+            fused_epilogues = "drelu_wgrad"
+        if fused_epilogues not in (False, None) + FFN_EPILOGUES:
+            raise ValueError(f"fused_epilogues must be False or one of "
+                             f"{FFN_EPILOGUES}, got {fused_epilogues!r}")
+        self.fused_epilogues = fused_epilogues or None
         self._training = False
         self.d = cfg.d_model
         self.H = cfg.n_heads
@@ -194,7 +201,7 @@ class TrainStep:
         self._compile()
         self._build_plan()
         if self.lt_ffn:
-            self.lt_ffn = self._probe_lt_ffn()
+            self.lt_ffn = self._probe_lt_ffn(self.lt_ffn)
 
         if _shared is None:
             self.scalars = drv.zeros(10, np.float32)
@@ -304,10 +311,12 @@ class TrainStep:
         self.k_act_bwd = self._kernel("act_bwd", ACT=act, EVW=evw)
         # FFN backward through cuBLASLt (ReLU gradient, dropout mask and bias
         # gradient fused into the g_y·W_downᵀ multiply): fp16 ReLU only.
-        self.lt_ffn = (self.fused_epilogues and half and act == 0 and evw == 8
-                       and cfg.d_ff % 128 == 0 and drv.lt_available())
+        ok = (half and act == 0 and evw == 8 and cfg.d_ff % 128 == 0
+              and self.fused_epilogues is not None and drv.lt_available())
+        self.lt_ffn = self.fused_epilogues if ok else None
         if self.lt_ffn:
             self.k_add_f32 = self._kernel("add_into_f32", ACT=act, EVW=evw)
+            self.k_acc_f32 = self._kernel("acc_f32", ACT=act, EVW=evw)
         self.k_split = self._kernel("split_heads")
         self.k_merge = self._kernel("merge_heads")
         # Attention: fused kernels per (queries, keys, causal) where they fit,
@@ -460,24 +469,48 @@ class TrainStep:
             if self.lt_ffn:
                 sub.bufs["mask"] = self._act(st.M * dff // 32, np.int32)
 
-    def _probe_lt_ffn(self):
-        """Run the fused FFN-backward multiply once per stack shape; False
-        (use the plain kernels) if cuBLASLt refuses it."""
-        dff = self.cfg.d_ff
+    def _probe_lt_ffn(self, mode):
+        """Plan (and time) the fused FFN-backward multiplies once per stack
+        shape; None (plain kernels) if cuBLASLt refuses them. The gradient
+        buffers are used as scratch, so zero them afterwards."""
+        self._p_ffn = 0.0
         try:
             for st in (self.enc, self.dec):
                 sub = next(s for s in st.subs if s.kind == "ffn")
-                drv.gemm_epilogue(
-                    st.h[0], self.W[f"{sub.prefix}.down.weight"],
-                    self._buf(f"{st.name}.ga", (st.M, dff)),
-                    epilogue="drelu_bgrad", bias=self._buf("ffn.db", (dff,)),
-                    aux=sub.bufs["mask"], trans_b=True)
+                self._ffn_bwd_lt(st, sub, st.x[0], st.h[0], mode)
             drv.synchronize()
-            return True
+            self.grad.fill_(0.0)
+            return mode
         except (RuntimeError, StopIteration) as exc:
             import warnings
             warnings.warn(f"fused FFN epilogue disabled: {exc}")
-            return False
+            self.grad.fill_(0.0)
+            return None
+
+    def _ffn_bwd_lt(self, st, sub, g_y, h, mode):
+        """g_u = mask ⊙ g_y·W_downᵀ / (1-p) through cuBLASLt (mask = a != 0
+        covers ReLU and dropout), the up-projection's weight gradient, and
+        its bias gradient from one of the two multiplies' epilogues."""
+        W, G, dff, pre = self.W, self.G, self.cfg.d_ff, sub.prefix
+        g_a = self._buf(f"{st.name}.ga", (st.M, dff))
+        alpha = 1.0 / (1.0 - self._p_ffn)
+        grid = -(-dff // _THREADS)
+        if mode == "drelu_bgrad":     # bias gradient (fp16) from g_u's multiply
+            db = self._buf("ffn.db", (dff,))
+            drv.gemm_epilogue(g_y, W[f"{pre}.down.weight"], g_a,
+                              epilogue="drelu_bgrad", bias=db,
+                              aux=sub.bufs["mask"], trans_b=True, alpha=alpha)
+            self.k_add_f32(grid, _THREADS, db, G[f"{pre}.up.bias"], dff)
+            drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
+        else:                         # bias gradient (fp32) from dW's multiply
+            drv.gemm_epilogue(g_y, W[f"{pre}.down.weight"], g_a,
+                              epilogue="drelu", aux=sub.bufs["mask"],
+                              trans_b=True, alpha=alpha)
+            db = self._buf("ffn.db32", (dff,), np.float32)
+            drv.gemm_epilogue(h, g_a, G[f"{pre}.up.weight"], epilogue="bgrad_b",
+                              bias=db, trans_a=True, beta=1.0)
+            self.k_acc_f32(grid, _THREADS, db, G[f"{pre}.up.bias"], dff)
+        return g_a
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -773,24 +806,16 @@ class TrainStep:
             dff = self.cfg.d_ff
             drv.gemm(sub.bufs["a"], g_y, G[f"{pre}.down.weight"], trans_a=True,
                      beta=1.0)
-            g_a = self._buf(f"{st.name}.ga", (M, dff))
             if self.lt_ffn:
-                # g_u = mask ⊙ g_y·W_downᵀ / (1-p) and its column sums, in
-                # the multiply; mask = (a != 0) covers ReLU and dropout.
-                db = self._buf("ffn.db", (dff,))
-                drv.gemm_epilogue(g_y, W[f"{pre}.down.weight"], g_a,
-                                  epilogue="drelu_bgrad", bias=db,
-                                  aux=sub.bufs["mask"], trans_b=True,
-                                  alpha=1.0 / (1.0 - self._p_ffn))
-                self.k_add_f32(-(-dff // _THREADS), _THREADS, db,
-                               G[f"{pre}.up.bias"], dff)
+                g_a = self._ffn_bwd_lt(st, sub, g_y, h, self.lt_ffn)
             else:
+                g_a = self._buf(f"{st.name}.ga", (M, dff))
                 drv.gemm(g_y, W[f"{pre}.down.weight"], g_a, trans_b=True)
                 blocks, threads, rpb = self._ffn_grid(M, dff)
                 self.k_act_bwd(blocks, threads, g_a, sub.bufs["u"],
                                G[f"{pre}.up.bias"], M, dff, rpb,
                                self._seed(sub.inner_seed), self._p_ffn)
-            drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
+                drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
             drv.gemm(g_a, W[f"{pre}.up.weight"], g_h, trans_b=True)
             return g_h
 

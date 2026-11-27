@@ -452,6 +452,13 @@ extern "C" __global__ void add_into_f32(const T* __restrict__ src,
     if (i < n) dst[i] += tof(src[i]);
 }
 
+// dst += src, both fp32 (a bias gradient written by cuBLASLt in fp32).
+extern "C" __global__ void acc_f32(const float* __restrict__ src,
+                                   float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
 // g (grad of a) -> grad of u, in place: g * dropout_mask * act'(u), and
 // dbias += column sums of the result (the bias gradient). Same layout as
 // bias_act_fwd.

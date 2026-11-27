@@ -322,15 +322,18 @@ def test_buckets_share_one_activation_block():
                                    err_msg=k)
 
 
-def test_fused_ffn_epilogue_matches_kernels():
-    """FFN backward through cuBLASLt (ReLU + dropout mask + bias gradient in
-    the multiply) against the plain act_bwd kernel, same dropout masks."""
+@pytest.mark.parametrize("mode", ["drelu_bgrad", "drelu_wgrad"])
+def test_fused_ffn_epilogue_matches_kernels(mode):
+    """FFN backward through cuBLASLt (ReLU + dropout mask in the multiply,
+    bias gradient from an epilogue) against the plain act_bwd kernel, same
+    dropout masks."""
     if not driver.lt_available():
         pytest.skip("cuBLASLt not loadable")
     cfg = small_config(d_ff=128, dropout=0.1)          # relu, d_ff % 128 == 0
-    _, fused = build(cfg, precision="fp16")
-    _, plain = build(cfg, precision="fp16", fused_epilogues=False)
-    assert fused.lt_ffn and not plain.lt_ffn
+    _, fused = build(cfg, precision="fp16", fused_epilogues=mode)
+    _, plain = build(cfg, precision="fp16")
+    assert fused.lt_ffn == mode and plain.lt_ffn is None
+    assert not fused.grad.numpy().any()               # the probe left nothing
     src, tgt_in, tgt_out = batch(cfg)
     for step in (fused, plain):
         step.forward_backward(src, tgt_in, tgt_out)

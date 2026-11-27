@@ -776,11 +776,17 @@ def _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type, c_type,
 #
 # Enum values from cublasLt.h (CUDA 12, unchanged since 11.x).
 
+# Names are in our row-major terms: cuBLASLt's operand A is our b (see
+# gemm), so "bgrad_b" (column sums of op(b)) is CUBLASLT_EPILOGUE_BGRADA.
 EPILOGUES = {"default": 1, "relu": 2, "relu_aux": 130, "bias": 4,
              "relu_bias": 6, "relu_aux_bias": 134, "drelu": 136,
-             "drelu_bgrad": 152}
+             "drelu_bgrad": 152, "bgrad_b": 256, "bgrad_a": 512}
 _LT_NEEDS_AUX = {"relu_aux", "relu_aux_bias", "drelu", "drelu_bgrad"}
-_LT_NEEDS_BIAS = {"bias", "relu_bias", "relu_aux_bias", "drelu_bgrad"}
+_LT_NEEDS_BIAS = {"bias", "relu_bias", "relu_aux_bias", "drelu_bgrad",
+                  "bgrad_b", "bgrad_a"}
+_LT_WRITES_BIAS = {"drelu_bgrad", "bgrad_b", "bgrad_a"}
+_LT_CANDIDATES = 8      # heuristic algorithms timed per multiply shape
+_LT_TUNE_REPS = 5
 _LT_DESC_TRANSA = 3
 _LT_DESC_TRANSB = 4
 _LT_DESC_EPILOGUE = 7
@@ -795,6 +801,7 @@ _lt_lib = None
 _lt_error: str | None = None
 _lt_handles: dict[int, tuple] = {}      # device -> (handle, workspace)
 _lt_plans: dict[tuple, tuple] = {}      # multiply key -> descriptors + algo
+_lt_times: dict[str, dict] = {}         # label -> {"chosen": i, "us": [...]}
 
 
 def _lt_load():
@@ -892,13 +899,17 @@ def _lt_result_type():
     return HeuristicResult
 
 
-def _lt_plan(key, m, n, k, trans_a, trans_b, ab_type, c_type, a, b, epilogue,
-             bias, aux):
-    """Descriptors and the heuristic's first algorithm for one multiply."""
+def lt_algorithms() -> dict[str, dict]:
+    """Per cuBLASLt multiply: µs of each heuristic candidate and the index
+    chosen (the fastest)."""
+    return {k: dict(v) for k, v in _lt_times.items()}
+
+
+def _lt_plan(key, label, m, n, k, trans_a, trans_b, ab_type, c_type, a, b,
+             epilogue, bias, aux, run):
+    """Descriptors and the fastest of the heuristic's algorithms for one
+    multiply. `run(desc, lay_b, lay_a, lay_c, result, c_ptr)` queues it."""
     import ctypes
-    plan = _lt_plans.get(key)
-    if plan is not None:
-        return plan
     lib = _lt()
     handle, _ = _lt_handle()
     desc = ctypes.c_void_p()
@@ -936,17 +947,41 @@ def _lt_plan(key, m, n, k, trans_a, trans_b, ab_type, c_type, a, b, epilogue,
     _lt_check(lib.cublasLtMatmulPreferenceSetAttribute(
         pref, ctypes.c_int(_LT_PREF_MAX_WORKSPACE), ctypes.byref(wsz),
         ctypes.c_size_t(8)), "preference attribute")
-    res = _lt_result_type()()
+    results = (_lt_result_type() * _LT_CANDIDATES)()
     count = ctypes.c_int(0)
     status = lib.cublasLtMatmulAlgoGetHeuristic(
-        handle, desc, lay_b, lay_a, lay_c, lay_c, pref, ctypes.c_int(1),
-        ctypes.byref(res), ctypes.byref(count))
+        handle, desc, lay_b, lay_a, lay_c, lay_c, pref,
+        ctypes.c_int(_LT_CANDIDATES), results, ctypes.byref(count))
     lib.cublasLtMatmulPreferenceDestroy(pref)
     _lt_check(status, "heuristic")
-    if count.value < 1:
-        raise RuntimeError(f"cuBLASLt has no algorithm for {epilogue} on "
-                           f"{_shape_label(m, n, k, trans_a, trans_b)}")
-    plan = _lt_plans[key] = (desc, lay_b, lay_a, lay_c, res)
+    cands = [results[i] for i in range(count.value)
+             if results[i].state == 0
+             and results[i].workspaceSize <= _LT_WORKSPACE]
+    if not cands:
+        raise RuntimeError(f"cuBLASLt has no algorithm for {label}")
+    # Time each candidate into a scratch output (c may be accumulated into);
+    # a written bias gradient is rewritten by the real call anyway.
+    scratch = _cp.empty((m, n), np.float16 if c_type == _CUDA_R_16F
+                        else np.float32)
+    start, end = _cp.cuda.Event(), _cp.cuda.Event()
+    times = []
+    for r in cands:
+        try:
+            run(desc, lay_b, lay_a, lay_c, r, int(scratch.data.ptr))
+            start.record()
+            for _ in range(_LT_TUNE_REPS):
+                run(desc, lay_b, lay_a, lay_c, r, int(scratch.data.ptr))
+            end.record()
+            end.synchronize()
+            times.append(_cp.cuda.get_elapsed_time(start, end) * 1e3
+                         / _LT_TUNE_REPS)
+        except RuntimeError:
+            times.append(float("inf"))
+    best = min(range(len(cands)), key=times.__getitem__)
+    if times[best] == float("inf"):
+        raise RuntimeError(f"no cuBLASLt algorithm ran for {label}")
+    _lt_times[label] = {"chosen": best, "us": [round(t, 1) for t in times]}
+    plan = _lt_plans[key] = (desc, lay_b, lay_a, lay_c, cands[best])
     return plan
 
 
@@ -964,9 +999,13 @@ def gemm_epilogue(a: Buffer, b: Buffer, c: Buffer, *, epilogue: str,
       "drelu"          c = P ⊙ aux
       "drelu_bgrad"    c = P ⊙ aux, bias = column sums of c (overwritten,
                        not added; bias has c's dtype)
-    aux is a ReLU bit mask with one bit per element of c, in row-major
-    order, least significant bit first (n must be a multiple of 128), held
-    in an int32 buffer of m·n/32 entries.
+      "bgrad_b"        c = P, bias = column sums of op(b)  (n entries)
+      "bgrad_a"        c = P, bias = row sums of op(a)     (m entries)
+    A written bias (gradient) has c's dtype. aux is a ReLU bit mask with one
+    bit per element of c, in row-major order, least significant bit first
+    (n must be a multiple of 128), held in an int32 buffer of m·n/32 entries.
+    The first multiply of each shape times up to 8 cuBLASLt algorithms and
+    keeps the fastest (see lt_algorithms()).
     """
     import ctypes
     _require()
@@ -983,9 +1022,10 @@ def gemm_epilogue(a: Buffer, b: Buffer, c: Buffer, *, epilogue: str,
                              f"{'needs' if epilogue in needed else 'takes no'} "
                              f"{name}")
     if bias is not None:
-        if bias.size != n:
-            raise ValueError(f"bias must have {n} entries, got {bias.size}")
-        if epilogue == "drelu_bgrad" and bias.dtype != c.dtype:
+        want = m if epilogue == "bgrad_a" else n
+        if bias.size != want:
+            raise ValueError(f"bias must have {want} entries, got {bias.size}")
+        if epilogue in _LT_WRITES_BIAS and bias.dtype != c.dtype:
             raise TypeError("the bias gradient must have c's dtype")
     if aux is not None:
         if n % 128:
@@ -995,22 +1035,29 @@ def gemm_epilogue(a: Buffer, b: Buffer, c: Buffer, *, epilogue: str,
     lib = _lt()
     handle, ws = _lt_handle()
     key = (_cp.cuda.Device().id, m, n, k, trans_a, trans_b, ab_type, c_type,
-           epilogue, None if bias is None else _CUDA_TYPE[bias.dtype])
-    desc, lay_b, lay_a, lay_c, res = _lt_plan(
-        key, m, n, k, trans_a, trans_b, ab_type, c_type, a, b, epilogue, bias,
-        aux)
-    if bias is not None:
-        _lt_set(desc, _LT_DESC_BIAS_POINTER, bias.ptr, ctypes.c_void_p)
-    if aux is not None:
-        _lt_set(desc, _LT_DESC_AUX_POINTER, aux.ptr, ctypes.c_void_p)
+           epilogue, None if bias is None else _CUDA_TYPE[bias.dtype],
+           beta != 0)
     al, be = ctypes.c_float(alpha), ctypes.c_float(beta)
-    label = _shape_label(m, n, k, trans_a, trans_b) + f" {epilogue}"
-    with _Timed("gemm_lt", 2.0 * m * n * k, label):
+    label = (_tuned_label(_shape_label(m, n, k, trans_a, trans_b), a, c, beta)
+             + f" {epilogue}")
+
+    def run(desc, lay_b, lay_a, lay_c, res, c_ptr):
         _lt_check(lib.cublasLtMatmul(
             handle, desc, ctypes.byref(al),
             ctypes.c_void_p(b.ptr), lay_b, ctypes.c_void_p(a.ptr), lay_a,
-            ctypes.byref(be), ctypes.c_void_p(c.ptr), lay_c,
-            ctypes.c_void_p(c.ptr), lay_c, ctypes.byref(res.algo),
-            ctypes.c_void_p(ws.ptr),
-            ctypes.c_size_t(min(res.workspaceSize, _LT_WORKSPACE)),
+            ctypes.byref(be), ctypes.c_void_p(c_ptr), lay_c,
+            ctypes.c_void_p(c_ptr), lay_c, ctypes.byref(res.algo),
+            ctypes.c_void_p(ws.ptr), ctypes.c_size_t(res.workspaceSize),
             ctypes.c_void_p(_current_stream_ptr())), "matmul")
+
+    plan = _lt_plans.get(key)
+    if plan is None:
+        plan = _lt_plan(key, label, m, n, k, trans_a, trans_b, ab_type, c_type,
+                        a, b, epilogue, bias, aux, run)
+    else:                     # pointers change between calls (layers, buckets)
+        if bias is not None:
+            _lt_set(plan[0], _LT_DESC_BIAS_POINTER, bias.ptr, ctypes.c_void_p)
+        if aux is not None:
+            _lt_set(plan[0], _LT_DESC_AUX_POINTER, aux.ptr, ctypes.c_void_p)
+    with _Timed("gemm_lt", 2.0 * m * n * k, label):
+        run(*plan, c.ptr)

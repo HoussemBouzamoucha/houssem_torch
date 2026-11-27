@@ -252,6 +252,28 @@ def test_lt_drelu_bgrad(trans_b):
 
 
 @needs_lt
+def test_lt_bias_gradient_epilogues():
+    """bgrad_b: column sums of op(b); bgrad_a: row sums of op(a); fp32
+    output accumulated with beta (the weight-gradient multiply)."""
+    m, n, k = 64, 256, 96
+    a = rng.standard_normal((k, m)).astype(np.float16)       # used as aᵀ
+    b = rng.standard_normal((k, n)).astype(np.float16)
+    c0 = rng.standard_normal((m, n)).astype(np.float32)
+    ref = a.astype(np.float32).T @ b.astype(np.float32) + c0
+    for epi, want in (("bgrad_b", b.astype(np.float32).sum(0)),
+                      ("bgrad_a", a.astype(np.float32).sum(0))):
+        c = driver.from_numpy(c0)
+        db = driver.empty(want.size, np.float32)
+        driver.gemm_epilogue(driver.from_numpy(a), driver.from_numpy(b), c,
+                             epilogue=epi, bias=db, trans_a=True, beta=1.0)
+        np.testing.assert_allclose(c.numpy(), ref, rtol=1e-2, atol=5e-2,
+                                   err_msg=epi)
+        np.testing.assert_allclose(db.numpy(), want, rtol=1e-3, atol=1e-2,
+                                   err_msg=epi)
+    assert driver.lt_algorithms()
+
+
+@needs_lt
 def test_lt_epilogue_argument_errors():
     a, b = driver.zeros((8, 16), np.float16), driver.zeros((16, 128), np.float16)
     c = driver.empty((8, 128), np.float16)

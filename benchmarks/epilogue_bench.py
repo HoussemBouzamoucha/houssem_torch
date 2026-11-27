@@ -1,9 +1,15 @@
-"""Training step with and without the cuBLASLt FFN-backward epilogue.
+"""Training step: FFN backward plain vs the two cuBLASLt epilogue modes.
 
-One `TrainStep` per batch size; the fused path is switched on and off on
-the same step (`step.lt_ffn`), alternating every round so the T4's drifting
-clock hits both alike. Reports the median ms per step and the GPU time of
-the FFN-backward pieces from one profiled step in each mode.
+One `TrainStep` per batch size; the FFN-backward mode is switched on the
+same step (`step.lt_ffn`), every mode once per round, so the T4's drifting
+clock hits all of them alike. Reports the median ms per step, the GPU time
+of the launches that differ (one profiled step per mode) and the cuBLASLt
+algorithm timings.
+
+    plain        gemm g_y·W_downᵀ, act_bwd kernel (mask, dropout, bias grad)
+    drelu_bgrad  one cuBLASLt multiply: mask + fp16 bias gradient
+    drelu_wgrad  cuBLASLt mask multiply; fp32 bias gradient from the
+                 weight-gradient multiply (BGRADA)
 
 Run from the repository root (needs CuPy, a CUDA GPU and cuBLASLt):
     python benchmarks/epilogue_bench.py --device 1 --batch-sizes 64 256
@@ -25,6 +31,13 @@ from houssem_torch.backends.cuda.train_step import TrainStep  # noqa: E402
 from houssem_torch.models import Transformer, TransformerConfig  # noqa: E402
 from trainstep_profile import make_batch, table  # noqa: E402
 
+MODES = (None, "drelu_bgrad", "drelu_wgrad")
+DIFFER = ("act_bwd", "add_into_f32", "acc_f32", "gemm_lt")
+
+
+def name(mode):
+    return mode or "plain"
+
 
 def time_steps(step, batch, n):
     t = drv.Timer()
@@ -34,15 +47,18 @@ def time_steps(step, batch, n):
     return t.stop() / n
 
 
-def ffn_bwd_us(step, batch):
-    """GPU µs of the launches that differ between the two modes."""
+def profiled_us(step, batch, d_ff):
+    """GPU µs of the launches that differ between modes, plus the plain
+    multiplies with a d_ff-wide side (FFN gemms)."""
     with drv.Profiler() as prof:
         step(*batch, lr=1e-4)
     out = defaultdict(float)
     for r in prof.records():
-        if r.name in ("act_bwd", "add_into_f32", "gemm_lt", "bias_act_fwd"):
+        if r.name in DIFFER:
             out[r.name] += r.ms * 1e3
-    return dict(out)
+        elif r.name == "gemm" and str(d_ff) in r.shape.split()[0].split("x"):
+            out["ffn gemm"] += r.ms * 1e3
+    return out
 
 
 def main():
@@ -58,42 +74,49 @@ def main():
     if not drv.is_available():
         sys.exit("needs CuPy and a CUDA GPU")
     cfg = TransformerConfig.from_json(args.config)
-    rows = []
+    rows, prof_rows = [], []
     for B in args.batch_sizes:
         batch = make_batch(cfg, B, args.src_len, args.tgt_len, 0.5)
         ht.manual_seed(0)
         step = TrainStep(Transformer(cfg), B, args.src_len, args.tgt_len,
-                         max_grad_norm=1.0, device=args.device)
+                         max_grad_norm=1.0, device=args.device,
+                         fused_epilogues="drelu_wgrad")
         if not step.lt_ffn:
             sys.exit("the fused FFN epilogue is unavailable on this setup")
-        ms = {True: [], False: []}
-        for mode in (True, False):
+        ms = {m: [] for m in MODES}
+        for mode in MODES:                      # plans + cuBLASLt tuning
             step.lt_ffn = mode
             time_steps(step, batch, 3)
         for _ in range(args.rounds):
-            for mode in (True, False):
+            for mode in MODES:
                 step.lt_ffn = mode
                 ms[mode].append(time_steps(step, batch, args.steps))
-        prof = {}
-        for mode in (True, False):
+        med = {m: statistics.median(ms[m]) for m in MODES}
+        base = med[None]
+        rows.append([B] + [f"{med[m]:.1f}" for m in MODES]
+                    + [f"{base / med[m]:.3f}" for m in MODES[1:]])
+        for mode in MODES:
             step.lt_ffn = mode
-            prof[mode] = ffn_bwd_us(step, batch)
-        step.lt_ffn = True
-        fused, plain = (statistics.median(ms[m]) for m in (True, False))
-        rows.append([B, f"{plain:.1f}", f"{fused:.1f}", f"{plain / fused:.3f}",
-                     f"{plain - fused:.2f}",
-                     ", ".join(f"{k} {v:.0f}" for k, v in sorted(prof[False].items())),
-                     ", ".join(f"{k} {v:.0f}" for k, v in sorted(prof[True].items()))])
-        print(f"batch {B}: plain {plain:.1f} ms, fused {fused:.1f} ms", flush=True)
+            p = profiled_us(step, batch, cfg.d_ff)
+            prof_rows.append([B, name(mode), f"{sum(p.values()):.0f}",
+                              ", ".join(f"{k} {v:.0f}" for k, v in sorted(p.items()))])
+        print(f"batch {B}: " + ", ".join(f"{name(m)} {med[m]:.1f} ms"
+                                         for m in MODES), flush=True)
         del step
         import cupy
         cupy.get_default_memory_pool().free_all_blocks()
     info = drv.device_info(args.device)
-    lines = [f"# FFN-backward epilogue on {info.name}", "",
+    lines = [f"# FFN-backward epilogues on {info.name}", "",
              f"`{args.config}`, {args.src_len}/{args.tgt_len} tokens, median of "
              f"{args.rounds} rounds x {args.steps} steps, modes alternating.", ""]
-    lines += table(["batch", "plain ms", "fused ms", "speedup", "saved ms",
-                    "plain µs (profiled)", "fused µs (profiled)"], rows)
+    lines += table(["batch"] + [f"{name(m)} ms" for m in MODES]
+                   + [f"{name(m)} speedup" for m in MODES[1:]], rows)
+    lines += ["", "Profiled step (µs): the launches that differ, and the FFN "
+              "plain gemms.", ""]
+    lines += table(["batch", "mode", "total µs", "parts"], prof_rows)
+    lines += ["", "cuBLASLt candidates (µs per call, chosen = fastest):", ""]
+    for label, v in drv.lt_algorithms().items():
+        lines.append(f"- `{label}`: chosen #{v['chosen']}, {v['us']}")
     print("\n".join(lines))
 
 
