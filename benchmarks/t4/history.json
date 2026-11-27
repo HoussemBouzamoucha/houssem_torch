@@ -1150,6 +1150,22 @@
     "1x256": 5.88
    },
    "conclusion": "Same update with 37% of the memory for 6% more time. Write-up: benchmarks/t4/2026-11-27_kaggle_t4_grad_accumulation.md"
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "5d7e79a",
+   "branch": "gpu/faster-gemms",
+   "tests_on_t4": "66 passed",
+   "script": "benchmarks/accum_bench.py --device 1 --micro 64 --k 4",
+   "kind": "re-run after the tolerance fix",
+   "step_ms": {
+    "4x64_accumulated": 293.3,
+    "1x256": 275.1
+   },
+   "memory_gb": {
+    "4x64_accumulated": 2.18,
+    "1x256": 5.88
+   }
   }
  ]
 }

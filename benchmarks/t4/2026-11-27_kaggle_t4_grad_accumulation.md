@@ -1,6 +1,6 @@
 # Gradient accumulation (Kaggle T4, 2026-11-27)
 
-Branch `gpu/faster-gemms`, commit 5854b5f. 65 of 66 GPU tests passed. The one
+Branch `gpu/faster-gemms`, commit 5854b5f (re-run on 5d7e79a: 66/66 pass, 293.3 vs 275.1 ms, same memory). First run: 65 of 66 GPU tests passed. The one
 failure was the weight comparison after 3 AdamW steps of accumulated vs. big
 batch (fp32): 1 of 12288 weights was off by 1.8e-5 against `atol=1e-5`. The
 loss and every gradient matched. It is rounding noise that AdamW amplifies, so
