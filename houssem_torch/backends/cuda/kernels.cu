@@ -1556,3 +1556,70 @@ extern "C" __global__ void decode_attn(
     }
 }
 #endif  // DEC_DK && DEC_LMAX
+
+// Log-softmax of each row and its kk best entries, best first (ties: lower
+// index first). One block per row: vals (rows, kk) fp32, idx (rows, kk).
+extern "C" __global__ void topk_logprob(const T* __restrict__ x, int cols,
+                                        int kk, float* __restrict__ vals,
+                                        int* __restrict__ idx) {
+    __shared__ float s_red[32];
+    __shared__ float s_v[32];
+    __shared__ int s_i[32];
+    __shared__ float s_last_v;
+    __shared__ int s_last_i;
+    const T* row = x + (size_t)blockIdx.x * cols;
+    float m = -INFINITY;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, tof(row[c]));
+    m = block_max(m, s_red);
+    float s = 0.f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) s += __expf(tof(row[c]) - m);
+    float lse = m + logf(block_sum(s, s_red));
+    if (threadIdx.x == 0) { s_last_v = INFINITY; s_last_i = -1; }
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = 0; r < kk; ++r) {
+        float lv = s_last_v;
+        int li = s_last_i;
+        float best = -INFINITY;
+        int bi = 0x7fffffff;
+        // the best entry strictly after (lv, li) in (value desc, index asc)
+        for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+            float v = tof(row[c]);
+            bool after = v < lv || (v == lv && c > li);
+            if (after && (v > best || (v == best && c < bi))) { best = v; bi = c; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        }
+        if (lane == 0) { s_v[warp] = best; s_i[warp] = bi; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int w = 1; w < (int)(blockDim.x >> 5); ++w)
+                if (s_v[w] > best || (s_v[w] == best && s_i[w] < bi)) {
+                    best = s_v[w]; bi = s_i[w];
+                }
+            size_t o = (size_t)blockIdx.x * kk + r;
+            vals[o] = bi == 0x7fffffff ? -INFINITY : best - lse;
+            idx[o] = bi == 0x7fffffff ? 0 : bi;
+            s_last_v = best;
+            s_last_i = bi;
+        }
+        __syncthreads();
+    }
+}
+
+// dst row r = src row idx[r]: the first row_len elements of rows `stride`
+// apart (reorders the key/value cache after a beam-search step).
+extern "C" __global__ void gather_rows(const T* __restrict__ src,
+                                       T* __restrict__ dst,
+                                       const int* __restrict__ idx, int rows,
+                                       int row_len, int stride) {
+    size_t n = (size_t)rows * row_len;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * blockDim.x) {
+        int r = (int)(i / row_len), e = (int)(i % row_len);
+        dst[(size_t)r * stride + e] = src[(size_t)idx[r] * stride + e];
+    }
+}

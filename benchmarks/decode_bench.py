@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[32, 64, 128])
     ap.add_argument("--src-len", type=int, default=64)
     ap.add_argument("--new-tokens", type=int, default=63)
+    ap.add_argument("--beam", type=int, default=4)
     ap.add_argument("--device", type=int, default=0)
     args = ap.parse_args()
     if not drv.is_available():
@@ -50,15 +51,24 @@ def main():
         drv.synchronize()
         s = time.perf_counter() - t0
         steps = out.shape[1]
-        rows.append([B, steps, f"{s * 1e3 / steps:.2f}", f"{B / s:.0f}",
-                     f"{B * steps / s:,.0f}"])
-        print(f"batch {B}: {steps} steps in {s:.2f} s", flush=True)
+        rows.append(["greedy", B, B, steps, f"{s * 1e3 / steps:.2f}",
+                     f"{B / s:.0f}"])
+        print(f"greedy, batch {B}: {steps} steps in {s:.2f} s", flush=True)
+        n = B // args.beam
+        t0 = time.perf_counter()
+        out = tr.translate_beam(src[:n], beam=args.beam,
+                                max_new_tokens=args.new_tokens)
+        drv.synchronize()
+        s = time.perf_counter() - t0
+        rows.append([f"beam {args.beam}", B, n, out.shape[1],
+                     f"{s * 1e3 / out.shape[1]:.2f}", f"{n / s:.0f}"])
+        print(f"beam {args.beam}, {n} sentences: {s:.2f} s", flush=True)
     info = drv.device_info(args.device)
     lines = [f"# Greedy decoding on {info.name}", "",
              f"`{args.config}`, random weights, sources of {args.src_len} "
              "tokens; time includes the encoder pass and the host loop.", ""]
-    lines += table(["batch", "steps", "ms / step", "sentences / s",
-                    "tokens / s"], rows)
+    lines += table(["search", "rows", "sentences", "steps", "ms / step",
+                    "sentences / s"], rows)
     print("\n".join(lines))
 
 

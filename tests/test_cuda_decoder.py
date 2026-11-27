@@ -99,3 +99,55 @@ def test_greedy_pads_short_batches_and_is_repeatable():
     np.testing.assert_array_equal(one, ref)
     with pytest.raises(ValueError):
         tr.translate_greedy(np.zeros((B + 3, S), np.int64))
+
+
+def cpu_beam(model, src, beam, alpha, max_new):
+    """Reference: the same bookkeeping, with the CPU model re-decoding every
+    prefix in full each step."""
+    from houssem_torch.models.beam import beam_search
+    cfg = model.cfg
+    n = src.shape[0]
+    rep = np.repeat(src, beam, axis=0)
+    with ht.no_grad():
+        memory, src_pad = model.encode(rep)
+    state = {"ys": np.full((n * beam, 1), cfg.bos_id, np.int64)}
+    kk = 2 * beam
+
+    def step_fn(tokens, parents, t):
+        if parents is not None:
+            state["ys"] = np.concatenate([state["ys"][parents],
+                                          tokens[:, None].astype(np.int64)], 1)
+        with ht.no_grad():
+            z = model.decode(state["ys"], memory, src_pad).numpy()[:, -1]
+        z = z.astype(np.float64)
+        lp = z - (z.max(1, keepdims=True)
+                  + np.log(np.exp(z - z.max(1, keepdims=True)).sum(1, keepdims=True)))
+        order = np.argsort(-lp, axis=1, kind="stable")[:, :kk]
+        return np.take_along_axis(lp, order, 1), order
+    return beam_search(step_fn, n, beam, max_new, bos=cfg.bos_id,
+                       eos=cfg.eos_id, pad=cfg.pad_id, alpha=alpha)
+
+
+def test_beam_one_matches_greedy():
+    cfg = config()
+    _, step = trained(cfg, "fp32")
+    src, _, _ = data(cfg, 2)
+    tr = Translator(step, B, S)
+    np.testing.assert_array_equal(tr.translate_beam(src, beam=1),
+                                  tr.translate_greedy(src))
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.6])
+def test_beam_matches_cpu_reference(alpha):
+    """GPU log-softmax/top-k and the cache reordering, against the CPU
+    model with the same bookkeeping (fp32)."""
+    cfg = config()
+    model, step = trained(cfg, "fp32")
+    src, _, _ = data(cfg, 1)
+    tr = Translator(step, B * 4, S)
+    got = tr.translate_beam(src, beam=4, alpha=alpha, max_new_tokens=10)
+    ref = cpu_beam(model, src, 4, alpha, 10)
+    np.testing.assert_array_equal(got, ref)
+    # and the cache is reset between calls (greedy after beam is unchanged)
+    np.testing.assert_array_equal(tr.translate_greedy(src),
+                                  model.translate_greedy(src))

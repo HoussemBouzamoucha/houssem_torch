@@ -2,6 +2,7 @@
 
     tr = Translator(step, batch_size=64, src_len=64)   # step: a TrainStep
     ids = tr.translate_greedy(src)                      # like Transformer's
+    ids = tr.translate_beam(src[:16], beam=4)           # 16 x 4 rows
 
 The encoder runs once per batch; each decoding step feeds one new token per
 sentence through the decoder (B rows, not B·T). Self-attention appends the
@@ -18,6 +19,7 @@ import math
 import numpy as np
 
 from houssem_torch.backends.cuda import driver as drv
+from houssem_torch.models.beam import beam_search
 from houssem_torch.backends.cuda.train_step import (_LN_EPS, _THREADS,
                                                     BucketedTrainStep,
                                                     TrainStep)
@@ -47,6 +49,10 @@ class Translator:
         self.k_attn = step._kernel("decode_attn", DEC_DK=self.dk,
                                    DEC_LMAX=max(self.Lmax, src_len))
         self.k_argmax = step._kernel("argmax_rows")
+        self.k_topk = step._kernel("topk_logprob")
+        self.k_gather = step._kernel("gather_rows")
+        self.parents = drv.zeros(B, np.int32)
+        self._spare = None   # second set of cache buffers for beam reordering
         self.subs = self.enc_step.dec.subs
         self.ids = drv.zeros(B, np.int32)
         self.next = drv.zeros(B, np.int32)
@@ -171,6 +177,50 @@ class Translator:
             if finished.all():
                 break
         return np.stack(out, axis=1)[:n].astype(np.int64)
+
+    def translate_beam(self, src, beam: int = 4, alpha: float = 0.6,
+                       max_new_tokens: int | None = None) -> np.ndarray:
+        """Beam search (see houssem_torch.models.beam): the best hypothesis
+        per sentence, (n, ≤ max_new_tokens) ids without <bos>, padded.
+        Uses n·beam rows, so n·beam must fit in batch_size. alpha: GNMT
+        length penalty exponent (0: plain sum of log-probs)."""
+        cfg, B = self.cfg, self.B
+        src = np.asarray(src)
+        n, K = src.shape[0], int(beam)
+        if n * K > B:
+            raise ValueError(f"{n} sentences x beam {K} exceed batch_size {B}")
+        max_new = min(max_new_tokens or cfg.max_len - 1, self.Lmax)
+        self._start(np.repeat(src, K, axis=0))
+        kk = min(2 * K, cfg.vocab_size)
+        if self._spare is None:
+            self._spare = {p: (drv.zeros(k.shape, k.dtype), drv.zeros(v.shape, v.dtype))
+                           for p, (k, v) in self.cache.items()}
+        vals = drv.zeros((B, kk), np.float32)
+        idx = drv.zeros((B, kk), np.int32)
+        rows = n * K
+        full_tok = np.full(B, cfg.pad_id, np.int32)
+        full_par = np.arange(B, dtype=np.int32)
+        d = self.d
+
+        def step_fn(tokens, parents, t):
+            if parents is not None and t > 0:
+                full_par[:rows] = parents
+                self.parents.copy_from(full_par)
+                n_el = B * t * d
+                grid = max(1, min(-(-n_el // _THREADS), 4096))
+                for p, (kc, vc) in self.cache.items():
+                    ks, vs = self._spare[p]
+                    for a, b_ in ((kc, ks), (vc, vs)):
+                        self.k_gather(grid, _THREADS, a, b_, self.parents, B,
+                                      t * d, self.Lmax * d)
+                    self.cache[p], self._spare[p] = (ks, vs), (kc, vc)
+            full_tok[:rows] = tokens
+            self.ids.copy_from(full_tok)
+            self.k_topk(B, 256, self._step(t), cfg.vocab_size, kk, vals, idx)
+            return vals.numpy()[:rows], idx.numpy()[:rows]
+
+        return beam_search(step_fn, n, K, max_new, bos=cfg.bos_id,
+                           eos=cfg.eos_id, pad=cfg.pad_id, alpha=alpha)
 
     def decode_logits(self, src, tgt_in) -> np.ndarray:
         """Logits (n, T, V) of teacher-forced decoding, one token at a time
