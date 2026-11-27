@@ -900,16 +900,30 @@ class TrainStep:
             buf.copy_from_async(h)
         self._stage_done[slot].record()
         self._stage_used[slot] = True
-        self._count = max(int((tgt_out != self.cfg.pad_id).sum()), 1)
+        self._count = target_tokens(tgt_out, self.cfg.pad_id)
 
-    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True) -> None:
-        """Loss and gradients for one batch (no parameter update)."""
+    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True, *,
+                         accumulate: bool = False,
+                         tokens: int | None = None) -> None:
+        """Loss and gradients for one batch (no parameter update).
+
+        accumulate: add to the gradients and loss already held (the second
+            and later micro-batches of one optimizer step) instead of
+            starting from zero.
+        tokens: the loss is the sum over target tokens divided by this
+            (default: this batch's own target tokens). For accumulation pass
+            the target tokens of all the micro-batches together, so the sum
+            is the mean over the whole batch. See `accumulate_step`.
+        """
         self._load_batch(src, tgt_in, tgt_out)
+        if tokens is not None:
+            self._count = max(int(tokens), 1)
         self._seeds = self._rng.integers(0, 2 ** 32, size=self._n_seeds,
                                          dtype=np.uint32)
-        with drv.region("optimizer"):
-            self.grad.fill_(0)
-            self.k_reset(1, 1, self.scalars)
+        if not accumulate:
+            with drv.region("optimizer"):
+                self.grad.fill_(0)
+                self.k_reset(1, 1, self.scalars)
         self._forward(train)
         self._backward()
 
@@ -933,6 +947,15 @@ class TrainStep:
         """One training step. Queued on the GPU: returns without waiting."""
         self.forward_backward(src, tgt_in, tgt_out, train=True)
         self.update(lr)
+
+    def accumulate_step(self, micro_batches, lr: float) -> None:
+        """One optimizer step over several micro-batches (gradient
+        accumulation): the same update as one batch holding all their rows,
+        with the activation memory of one micro-batch.
+
+            step.accumulate_step([(src, tgt_in, tgt_out), ...], lr)
+        """
+        accumulate_step(self, micro_batches, lr, self.cfg.pad_id)
 
     def evaluate(self, src, tgt_in, tgt_out) -> float:
         """Loss without dropout and without updating anything (waits)."""
@@ -968,6 +991,24 @@ class TrainStep:
     def memory_bytes(self) -> int:
         """Device memory held by this step's buffers."""
         return drv.memory_in_use()
+
+
+def target_tokens(tgt_out, pad) -> int:
+    """Non-padding target tokens (the loss normaliser), at least 1."""
+    return max(int((np.asarray(tgt_out) != pad).sum()), 1)
+
+
+def accumulate_step(step, micro_batches, lr, pad) -> None:
+    """Gradient accumulation for TrainStep and BucketedTrainStep: forward
+    and backward every micro-batch into the same gradients, each loss term
+    divided by the target tokens of all of them, then one update."""
+    micro_batches = [tuple(b) for b in micro_batches]
+    if not micro_batches:
+        raise ValueError("accumulate_step needs at least one micro-batch")
+    total = sum(target_tokens(b[2], pad) for b in micro_batches)
+    for i, b in enumerate(micro_batches):
+        step.forward_backward(*b, train=True, accumulate=i > 0, tokens=total)
+    step.update(lr)
 
 
 def _used_width(a, pad):
@@ -1071,10 +1112,17 @@ class BucketedTrainStep:
                        _fit_width(tgt_in, T, self.pad),
                        _fit_width(tgt_out, T, self.pad))
 
-    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True) -> None:
+    def forward_backward(self, src, tgt_in, tgt_out, train: bool = True, *,
+                         accumulate: bool = False,
+                         tokens: int | None = None) -> None:
+        """See TrainStep.forward_backward. Micro-batches of one accumulated
+        step may fall in different buckets: all buckets share the
+        gradients."""
         shape, batch = self._route(src, tgt_in, tgt_out)
         self.counts[shape] += 1
-        self.steps[shape].forward_backward(*batch, train=train)
+        self.steps[shape].forward_backward(*batch, train=train,
+                                           accumulate=accumulate,
+                                           tokens=tokens)
 
     def update(self, lr: float) -> None:
         self.main.update(lr)
@@ -1083,6 +1131,11 @@ class BucketedTrainStep:
         """One training step on the batch's bucket (queued, does not wait)."""
         self.forward_backward(src, tgt_in, tgt_out, train=True)
         self.update(lr)
+
+    def accumulate_step(self, micro_batches, lr: float) -> None:
+        """One optimizer step over several micro-batches, each on its own
+        bucket (see TrainStep.accumulate_step)."""
+        accumulate_step(self, micro_batches, lr, self.pad)
 
     def evaluate(self, src, tgt_in, tgt_out) -> float:
         shape, batch = self._route(src, tgt_in, tgt_out)
