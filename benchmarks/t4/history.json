@@ -1133,6 +1133,23 @@
     }
    },
    "conclusion": "cuBLASLt epilogue kernels on Turing are 1.35-2.5x slower than plain cuBLAS per multiply (autotuned over 8 candidates); fused epilogues off by default. Write-up: benchmarks/t4/2026-11-27_kaggle_t4_lt_epilogues.md"
+  },
+  {
+   "date": "2026-11-27",
+   "commit": "5854b5f",
+   "branch": "gpu/faster-gemms",
+   "tests_on_t4": "65 passed, 1 failed (AdamW-amplified rounding, tolerance loosened)",
+   "script": "benchmarks/accum_bench.py --device 1 --micro 64 --k 4",
+   "kind": "gradient accumulation 4x64 vs one 256-row batch",
+   "step_ms": {
+    "4x64_accumulated": 293.9,
+    "1x256": 277.0
+   },
+   "memory_gb": {
+    "4x64_accumulated": 2.18,
+    "1x256": 5.88
+   },
+   "conclusion": "Same update with 37% of the memory for 6% more time. Write-up: benchmarks/t4/2026-11-27_kaggle_t4_grad_accumulation.md"
   }
  ]
 }

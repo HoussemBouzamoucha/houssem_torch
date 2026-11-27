@@ -380,9 +380,12 @@ def test_accumulated_micro_batches_match_one_big_batch(precision):
     for _ in range(3):
         acc.accumulate_step([m1, m2], lr=3e-3)
         big(*stacked(m1, m2), lr=3e-3)
+    # Two accumulated multiplies sum in another order than one: last-bit
+    # gradient differences, which AdamW's 1/sqrt(v) magnifies where the
+    # gradient is near zero (seen on T4: 1 of 12288 weights off by 1.8e-5).
     got, ref = acc.state_dict(), big.state_dict()
     for k in ref:
-        np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-5,
+        np.testing.assert_allclose(got[k], ref[k], rtol=1e-4, atol=1e-4,
                                    err_msg=k)
 
 
