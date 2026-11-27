@@ -139,6 +139,7 @@ class TrainStep:
                  seed: int = 0, init_scale: float = 2.0 ** 16,
                  growth_interval: int = 2000, device: int = 0,
                  fused_attention: bool = True, tune_gemms: bool = False,
+                 fused_epilogues: bool = True,
                  _shared: TrainStep | None = None,
                  _arena: drv.Arena | None = None):
         if not drv.is_available():
@@ -161,7 +162,8 @@ class TrainStep:
                              init_scale=init_scale,
                              growth_interval=growth_interval, device=device,
                              fused_attention=fused_attention,
-                             tune_gemms=tune_gemms)
+                             tune_gemms=tune_gemms,
+                             fused_epilogues=fused_epilogues)
         self.cfg = cfg
         self.B, self.S, self.T = batch_size, src_len, tgt_len
         self.precision = precision
@@ -173,6 +175,8 @@ class TrainStep:
         self.max_grad_norm = max_grad_norm
         self.growth_interval = growth_interval
         self.fused_attention = bool(fused_attention)
+        self.fused_epilogues = bool(fused_epilogues)
+        self._training = False
         self.d = cfg.d_model
         self.H = cfg.n_heads
         self.dk = cfg.d_model // cfg.n_heads
@@ -189,6 +193,8 @@ class TrainStep:
             self._share_parameters(_shared)
         self._compile()
         self._build_plan()
+        if self.lt_ffn:
+            self.lt_ffn = self._probe_lt_ffn()
 
         if _shared is None:
             self.scalars = drv.zeros(10, np.float32)
@@ -296,6 +302,12 @@ class TrainStep:
         self.evw = evw
         self.k_bias_act = self._kernel("bias_act_fwd", ACT=act, EVW=evw)
         self.k_act_bwd = self._kernel("act_bwd", ACT=act, EVW=evw)
+        # FFN backward through cuBLASLt (ReLU gradient, dropout mask and bias
+        # gradient fused into the g_y·W_downᵀ multiply): fp16 ReLU only.
+        self.lt_ffn = (self.fused_epilogues and half and act == 0 and evw == 8
+                       and cfg.d_ff % 128 == 0 and drv.lt_available())
+        if self.lt_ffn:
+            self.k_add_f32 = self._kernel("add_into_f32", ACT=act, EVW=evw)
         self.k_split = self._kernel("split_heads")
         self.k_merge = self._kernel("merge_heads")
         # Attention: fused kernels per (queries, keys, causal) where they fit,
@@ -445,6 +457,27 @@ class TrainStep:
         else:
             dff = self.cfg.d_ff
             sub.bufs.update(u=z(st.M, dff), a=z(st.M, dff))
+            if self.lt_ffn:
+                sub.bufs["mask"] = self._act(st.M * dff // 32, np.int32)
+
+    def _probe_lt_ffn(self):
+        """Run the fused FFN-backward multiply once per stack shape; False
+        (use the plain kernels) if cuBLASLt refuses it."""
+        dff = self.cfg.d_ff
+        try:
+            for st in (self.enc, self.dec):
+                sub = next(s for s in st.subs if s.kind == "ffn")
+                drv.gemm_epilogue(
+                    st.h[0], self.W[f"{sub.prefix}.down.weight"],
+                    self._buf(f"{st.name}.ga", (st.M, dff)),
+                    epilogue="drelu_bgrad", bias=self._buf("ffn.db", (dff,)),
+                    aux=sub.bufs["mask"], trans_b=True)
+            drv.synchronize()
+            return True
+        except (RuntimeError, StopIteration) as exc:
+            import warnings
+            warnings.warn(f"fused FFN epilogue disabled: {exc}")
+            return False
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -487,6 +520,7 @@ class TrainStep:
         cfg = self.cfg
         self._p_res = self._p_emb = self._p_attn = float(cfg.dropout) if train else 0.0
         self._p_ffn = float(cfg.ffn_dropout_rate) if train else 0.0
+        self._training = train
         with drv.region("fwd"):
             self._fwd_stack(self.enc)
             self._fwd_stack(self.dec)
@@ -549,8 +583,9 @@ class TrainStep:
             u, a = sub.bufs["u"], sub.bufs["a"]
             drv.gemm(h, W[f"{pre}.up.weight"], u)
             blocks, threads, rpb = self._ffn_grid(M, self.cfg.d_ff)
-            self.k_bias_act(blocks, threads, u, W[f"{pre}.up.bias"], a, M,
-                            self.cfg.d_ff, rpb, self._seed(sub.inner_seed),
+            mask = sub.bufs.get("mask") if self._training else None
+            self.k_bias_act(blocks, threads, u, W[f"{pre}.up.bias"], a, mask,
+                            M, self.cfg.d_ff, rpb, self._seed(sub.inner_seed),
                             self._p_ffn)
             drv.gemm(a, W[f"{pre}.down.weight"], y)
             return y
@@ -739,11 +774,22 @@ class TrainStep:
             drv.gemm(sub.bufs["a"], g_y, G[f"{pre}.down.weight"], trans_a=True,
                      beta=1.0)
             g_a = self._buf(f"{st.name}.ga", (M, dff))
-            drv.gemm(g_y, W[f"{pre}.down.weight"], g_a, trans_b=True)
-            blocks, threads, rpb = self._ffn_grid(M, dff)
-            self.k_act_bwd(blocks, threads, g_a, sub.bufs["u"],
-                           G[f"{pre}.up.bias"], M, dff, rpb,
-                           self._seed(sub.inner_seed), self._p_ffn)
+            if self.lt_ffn:
+                # g_u = mask ⊙ g_y·W_downᵀ / (1-p) and its column sums, in
+                # the multiply; mask = (a != 0) covers ReLU and dropout.
+                db = self._buf("ffn.db", (dff,))
+                drv.gemm_epilogue(g_y, W[f"{pre}.down.weight"], g_a,
+                                  epilogue="drelu_bgrad", bias=db,
+                                  aux=sub.bufs["mask"], trans_b=True,
+                                  alpha=1.0 / (1.0 - self._p_ffn))
+                self.k_add_f32(-(-dff // _THREADS), _THREADS, db,
+                               G[f"{pre}.up.bias"], dff)
+            else:
+                drv.gemm(g_y, W[f"{pre}.down.weight"], g_a, trans_b=True)
+                blocks, threads, rpb = self._ffn_grid(M, dff)
+                self.k_act_bwd(blocks, threads, g_a, sub.bufs["u"],
+                               G[f"{pre}.up.bias"], M, dff, rpb,
+                               self._seed(sub.inner_seed), self._p_ffn)
             drv.gemm(h, g_a, G[f"{pre}.up.weight"], trans_a=True, beta=1.0)
             drv.gemm(g_a, W[f"{pre}.up.weight"], g_h, trans_b=True)
             return g_h

@@ -320,3 +320,23 @@ def test_buckets_share_one_activation_block():
     for k in ref:
         np.testing.assert_allclose(got[k], ref[k], rtol=1e-5, atol=1e-6,
                                    err_msg=k)
+
+
+def test_fused_ffn_epilogue_matches_kernels():
+    """FFN backward through cuBLASLt (ReLU + dropout mask + bias gradient in
+    the multiply) against the plain act_bwd kernel, same dropout masks."""
+    if not driver.lt_available():
+        pytest.skip("cuBLASLt not loadable")
+    cfg = small_config(d_ff=128, dropout=0.1)          # relu, d_ff % 128 == 0
+    _, fused = build(cfg, precision="fp16")
+    _, plain = build(cfg, precision="fp16", fused_epilogues=False)
+    assert fused.lt_ffn and not plain.lt_ffn
+    src, tgt_in, tgt_out = batch(cfg)
+    for step in (fused, plain):
+        step.forward_backward(src, tgt_in, tgt_out)
+    assert fused.last_loss() == pytest.approx(plain.last_loss(), rel=1e-3)
+    a, b = fused.gradients(), plain.gradients()
+    assert_grads_close(a, b, 2e-2)
+    for name in a:
+        if name.endswith("up.bias"):
+            assert np.abs(b[name]).max() > 0, name     # the check means something

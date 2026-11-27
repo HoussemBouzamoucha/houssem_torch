@@ -761,3 +761,256 @@ def _gemm_strided(a, b, c, m, n, k, batch, trans_a, trans_b, ab_type, c_type,
         be.ctypes.data,
         c.ptr, c_type, n, m * n,
         batch, _CUBLAS_COMPUTE_32F, algo)
+
+
+# ---------------------------------------------------------------------------
+# cuBLASLt multiply with a fused epilogue (ctypes: CuPy has no binding)
+# ---------------------------------------------------------------------------
+# cuBLASLt runs the same tensor-core kernels as cuBLAS but can finish the
+# product with an elementwise step and a column reduction inside the
+# multiply, so the product is never written out and read back by a separate
+# kernel. The engine uses it in the feed-forward backward:
+#     g_u = mask ⊙ (alpha · g_y · W_downᵀ),   db_up = Σ_rows g_u,
+# where `mask` is the 1-bit "ReLU active and kept by dropout" pattern that
+# the forward kernel writes, and alpha = 1/(1-p) is the dropout scale.
+#
+# Enum values from cublasLt.h (CUDA 12, unchanged since 11.x).
+
+EPILOGUES = {"default": 1, "relu": 2, "relu_aux": 130, "bias": 4,
+             "relu_bias": 6, "relu_aux_bias": 134, "drelu": 136,
+             "drelu_bgrad": 152}
+_LT_NEEDS_AUX = {"relu_aux", "relu_aux_bias", "drelu", "drelu_bgrad"}
+_LT_NEEDS_BIAS = {"bias", "relu_bias", "relu_aux_bias", "drelu_bgrad"}
+_LT_DESC_TRANSA = 3
+_LT_DESC_TRANSB = 4
+_LT_DESC_EPILOGUE = 7
+_LT_DESC_BIAS_POINTER = 8
+_LT_DESC_AUX_POINTER = 11
+_LT_DESC_AUX_LD = 12
+_LT_DESC_BIAS_DATA_TYPE = 26
+_LT_PREF_MAX_WORKSPACE = 1
+_LT_WORKSPACE = 4 << 20
+
+_lt_lib = None
+_lt_error: str | None = None
+_lt_handles: dict[int, tuple] = {}      # device -> (handle, workspace)
+_lt_plans: dict[tuple, tuple] = {}      # multiply key -> descriptors + algo
+
+
+def _lt_load():
+    """The cuBLASLt library matching CuPy's CUDA major version."""
+    import ctypes
+    import glob
+    import os
+    import sys
+    major = _rt.runtimeGetVersion() // 1000
+    if sys.platform == "win32":
+        names, sub = [f"cublasLt64_{major}.dll"], "bin"
+    else:
+        names, sub = [f"libcublasLt.so.{major}", "libcublasLt.so"], "lib"
+    tried = []
+    for name in names:          # already loaded alongside cuBLAS, or on the
+        try:                    # loader path
+            return ctypes.CDLL(name)
+        except OSError as exc:
+            tried.append(str(exc))
+    dirs = []
+    try:                        # pip wheels (nvidia-cublas-cu12)
+        import nvidia.cublas as nv_cublas
+        dirs += [os.path.join(p, sub) for p in nv_cublas.__path__]
+    except Exception:  # noqa: BLE001
+        pass
+    for env in ("CUDA_PATH", "CUDA_HOME"):
+        if os.environ.get(env):
+            dirs += [os.path.join(os.environ[env], d) for d in ("bin", "lib64")]
+    for d in dirs:
+        for path in sorted(glob.glob(os.path.join(d, names[0] + "*"))):
+            try:
+                return ctypes.CDLL(path)
+            except OSError as exc:
+                tried.append(str(exc))
+    raise OSError("cuBLASLt not found: " + "; ".join(tried))
+
+
+def _lt():
+    global _lt_lib, _lt_error
+    if _lt_lib is None and _lt_error is None:
+        try:
+            _lt_lib = _lt_load()
+        except Exception as exc:  # noqa: BLE001
+            _lt_error = str(exc)
+    if _lt_lib is None:
+        raise RuntimeError(f"cuBLASLt unavailable: {_lt_error}")
+    return _lt_lib
+
+
+def lt_available() -> bool:
+    """True if cuBLASLt loads (`gemm_epilogue` can run)."""
+    if not is_available():
+        return False
+    try:
+        _lt()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _lt_check(status, what):
+    if status != 0:
+        raise RuntimeError(f"cuBLASLt {what} failed (status {status})")
+
+
+def _lt_handle():
+    import ctypes
+    dev = _cp.cuda.Device().id
+    h = _lt_handles.get(dev)
+    if h is None:
+        handle = ctypes.c_void_p()
+        _lt_check(_lt().cublasLtCreate(ctypes.byref(handle)), "create")
+        h = _lt_handles[dev] = (handle, empty(_LT_WORKSPACE // 4, np.int32))
+    return h
+
+
+def _lt_set(desc, attr, value, ctype):
+    import ctypes
+    v = ctype(value)
+    _lt_check(_lt().cublasLtMatmulDescSetAttribute(
+        desc, ctypes.c_int(attr), ctypes.byref(v),
+        ctypes.c_size_t(ctypes.sizeof(v))), f"attribute {attr}")
+
+
+def _lt_result_type():
+    """ctypes mirror of cublasLtMatmulHeuristicResult_t."""
+    import ctypes
+
+    class HeuristicResult(ctypes.Structure):
+        _fields_ = [("algo", ctypes.c_uint64 * 8),
+                    ("workspaceSize", ctypes.c_size_t),
+                    ("state", ctypes.c_int),
+                    ("wavesCount", ctypes.c_float),
+                    ("reserved", ctypes.c_int * 4)]
+    return HeuristicResult
+
+
+def _lt_plan(key, m, n, k, trans_a, trans_b, ab_type, c_type, a, b, epilogue,
+             bias, aux):
+    """Descriptors and the heuristic's first algorithm for one multiply."""
+    import ctypes
+    plan = _lt_plans.get(key)
+    if plan is not None:
+        return plan
+    lib = _lt()
+    handle, _ = _lt_handle()
+    desc = ctypes.c_void_p()
+    _lt_check(lib.cublasLtMatmulDescCreate(
+        ctypes.byref(desc), ctypes.c_int(_CUBLAS_COMPUTE_32F),
+        ctypes.c_int(_CUDA_R_32F)), "descriptor")
+    # Row-major C(m,n) = op(A)·op(B) is column-major Cᵀ(n,m) = op(B)ᵀ·op(A)ᵀ,
+    # so cuBLASLt's first operand is our b and its second our a (as in gemm).
+    _lt_set(desc, _LT_DESC_TRANSA, int(trans_b), ctypes.c_int)
+    _lt_set(desc, _LT_DESC_TRANSB, int(trans_a), ctypes.c_int)
+    _lt_set(desc, _LT_DESC_EPILOGUE, EPILOGUES[epilogue], ctypes.c_uint32)
+    if bias is not None:      # pointers are set before the heuristic: it
+        _lt_set(desc, _LT_DESC_BIAS_POINTER, bias.ptr, ctypes.c_void_p)
+        _lt_set(desc, _LT_DESC_BIAS_DATA_TYPE, _CUDA_TYPE[bias.dtype],
+                ctypes.c_int)     # checks their alignment
+    if aux is not None:
+        _lt_set(desc, _LT_DESC_AUX_POINTER, aux.ptr, ctypes.c_void_p)
+        _lt_set(desc, _LT_DESC_AUX_LD, n, ctypes.c_int64)
+
+    def layout(dtype, rows, cols):      # column-major, ld = rows
+        lay = ctypes.c_void_p()
+        _lt_check(lib.cublasLtMatrixLayoutCreate(
+            ctypes.byref(lay), ctypes.c_int(dtype), ctypes.c_uint64(rows),
+            ctypes.c_uint64(cols), ctypes.c_int64(rows)), "layout")
+        return lay
+
+    # A row-major (r, c) buffer is the column-major (c, r) matrix.
+    lay_b = layout(ab_type, b.shape[1], b.shape[0])
+    lay_a = layout(ab_type, a.shape[1], a.shape[0])
+    lay_c = layout(c_type, n, m)
+    pref = ctypes.c_void_p()
+    _lt_check(lib.cublasLtMatmulPreferenceCreate(ctypes.byref(pref)),
+              "preference")
+    wsz = ctypes.c_uint64(_LT_WORKSPACE)
+    _lt_check(lib.cublasLtMatmulPreferenceSetAttribute(
+        pref, ctypes.c_int(_LT_PREF_MAX_WORKSPACE), ctypes.byref(wsz),
+        ctypes.c_size_t(8)), "preference attribute")
+    res = _lt_result_type()()
+    count = ctypes.c_int(0)
+    status = lib.cublasLtMatmulAlgoGetHeuristic(
+        handle, desc, lay_b, lay_a, lay_c, lay_c, pref, ctypes.c_int(1),
+        ctypes.byref(res), ctypes.byref(count))
+    lib.cublasLtMatmulPreferenceDestroy(pref)
+    _lt_check(status, "heuristic")
+    if count.value < 1:
+        raise RuntimeError(f"cuBLASLt has no algorithm for {epilogue} on "
+                           f"{_shape_label(m, n, k, trans_a, trans_b)}")
+    plan = _lt_plans[key] = (desc, lay_b, lay_a, lay_c, res)
+    return plan
+
+
+def gemm_epilogue(a: Buffer, b: Buffer, c: Buffer, *, epilogue: str,
+                  bias: Buffer | None = None, aux: Buffer | None = None,
+                  trans_a: bool = False, trans_b: bool = False,
+                  alpha: float = 1.0, beta: float = 0.0) -> None:
+    """`gemm` with a cuBLASLt epilogue fused into the multiply (row-major).
+
+    With P = alpha·op(a)@op(b) + beta·c:
+      "default"        c = P
+      "bias"           c = P + bias                 (bias: n entries)
+      "relu_bias"      c = relu(P + bias)
+      "relu_aux_bias"  c = relu(P + bias), aux = bit mask of c > 0
+      "drelu"          c = P ⊙ aux
+      "drelu_bgrad"    c = P ⊙ aux, bias = column sums of c (overwritten,
+                       not added; bias has c's dtype)
+    aux is a ReLU bit mask with one bit per element of c, in row-major
+    order, least significant bit first (n must be a multiple of 128), held
+    in an int32 buffer of m·n/32 entries.
+    """
+    import ctypes
+    _require()
+    if epilogue not in EPILOGUES:
+        raise ValueError(f"unknown epilogue {epilogue!r}")
+    m, n, k = _gemm_dims(a.shape, b.shape, trans_a, trans_b)
+    if c.shape != (m, n):
+        raise ValueError(f"c must be {(m, n)}, got {c.shape}")
+    ab_type, c_type = _gemm_types(a, b, c)
+    for name, needed, given in (("bias", _LT_NEEDS_BIAS, bias),
+                                ("aux mask", _LT_NEEDS_AUX, aux)):
+        if (epilogue in needed) != (given is not None):
+            raise ValueError(f"epilogue {epilogue!r} "
+                             f"{'needs' if epilogue in needed else 'takes no'} "
+                             f"{name}")
+    if bias is not None:
+        if bias.size != n:
+            raise ValueError(f"bias must have {n} entries, got {bias.size}")
+        if epilogue == "drelu_bgrad" and bias.dtype != c.dtype:
+            raise TypeError("the bias gradient must have c's dtype")
+    if aux is not None:
+        if n % 128:
+            raise ValueError("the ReLU mask needs n divisible by 128")
+        if aux.dtype != np.int32 or aux.size * 32 != m * n:
+            raise ValueError(f"aux must be int32 with {m * n // 32} entries")
+    lib = _lt()
+    handle, ws = _lt_handle()
+    key = (_cp.cuda.Device().id, m, n, k, trans_a, trans_b, ab_type, c_type,
+           epilogue, None if bias is None else _CUDA_TYPE[bias.dtype])
+    desc, lay_b, lay_a, lay_c, res = _lt_plan(
+        key, m, n, k, trans_a, trans_b, ab_type, c_type, a, b, epilogue, bias,
+        aux)
+    if bias is not None:
+        _lt_set(desc, _LT_DESC_BIAS_POINTER, bias.ptr, ctypes.c_void_p)
+    if aux is not None:
+        _lt_set(desc, _LT_DESC_AUX_POINTER, aux.ptr, ctypes.c_void_p)
+    al, be = ctypes.c_float(alpha), ctypes.c_float(beta)
+    label = _shape_label(m, n, k, trans_a, trans_b) + f" {epilogue}"
+    with _Timed("gemm_lt", 2.0 * m * n * k, label):
+        _lt_check(lib.cublasLtMatmul(
+            handle, desc, ctypes.byref(al),
+            ctypes.c_void_p(b.ptr), lay_b, ctypes.c_void_p(a.ptr), lay_a,
+            ctypes.byref(be), ctypes.c_void_p(c.ptr), lay_c,
+            ctypes.c_void_p(c.ptr), lay_c, ctypes.byref(res.algo),
+            ctypes.c_void_p(ws.ptr),
+            ctypes.c_size_t(min(res.workspaceSize, _LT_WORKSPACE)),
+            ctypes.c_void_p(_current_stream_ptr())), "matmul")
