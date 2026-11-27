@@ -44,6 +44,12 @@ DECODE_ROWS = 128                 # Translator batch (beam: 32 sentences)
 MAX_GRAD_NORM = 1.0
 SEED = 0
 
+import os as _os
+
+QUICK = _os.environ.get("HT_QUICK") == "1"   # smoke test of the whole script
+if QUICK:
+    TRAIN_STEPS, WARMUP_STEPS, VAL_EVERY, BLEU_EVERY = 200, 100, 100, 200
+
 # %% Cell 2: get the code, dependencies, GPU, tests
 import os
 import subprocess
@@ -114,6 +120,9 @@ def pairs_of(split):
 
 train_pairs = [p for p in pairs_of("train") if p[0].strip() and p[1].strip()]
 val_pairs, test_pairs = pairs_of("validation"), pairs_of("test")
+if QUICK:
+    train_pairs, val_pairs, test_pairs = (train_pairs[:100000], val_pairs[:512],
+                                          test_pairs[:256])
 
 base_cfg = TransformerConfig.from_json(f"{REPO_DIR}/configs/transformer_base.json")
 SPECIALS = ["<pad>", "<bos>", "<eos>", "<unk>"]
