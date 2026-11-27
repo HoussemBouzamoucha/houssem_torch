@@ -38,8 +38,9 @@ class Translator:
         cfg = step.cfg
         if src_len > cfg.max_len:
             raise ValueError(f"src_len exceeds max_len {cfg.max_len}")
-        # A step of this source shape (sharing the weights) runs the encoder.
-        self.enc_step = step.with_shape(batch_size, src_len, src_len)
+        # A step of this source shape (sharing the weights) runs the encoder;
+        # its own decoder is never used, so it gets a short dummy length.
+        self.enc_step = step.with_shape(batch_size, src_len, min(8, src_len))
         self.step, self.cfg = step, cfg
         self.B, self.S = batch_size, src_len
         self.Lmax = cfg.max_len
