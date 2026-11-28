@@ -1166,6 +1166,49 @@
     "4x64_accumulated": 2.18,
     "1x256": 5.88
    }
+  },
+  {
+   "date": "2026-11-28",
+   "commit": "dbb1421",
+   "branch": "train/quality",
+   "script": "benchmarks/quality_kaggle.py (HT_QUICK=0)",
+   "kind": "training quality, houssem_torch only",
+   "data": "opus-100 fr->en, 933333 train pairs, 2000 test sentences",
+   "steps": 10000,
+   "warmup": 2000,
+   "runs": {
+    "x4 lr1": {
+     "tokens_per_step": 5872,
+     "epochs": 3.6,
+     "ms_per_step": 211.2,
+     "val_loss": 3.318,
+     "bleu_greedy": 26.62,
+     "bleu_beam4": 27.18,
+     "wall_s": 2112,
+     "memory_gb": 5.61
+    },
+    "x4 lr2": {
+     "tokens_per_step": 5872,
+     "epochs": 3.6,
+     "ms_per_step": 210.8,
+     "val_loss": 3.3137,
+     "bleu_greedy": 26.18,
+     "bleu_beam4": 26.97,
+     "wall_s": 2108,
+     "memory_gb": 5.61
+    },
+    "x8 lr2.8 (2x accumulated)": {
+     "tokens_per_step": 11745,
+     "epochs": 7.2,
+     "ms_per_step": 413.9,
+     "val_loss": 3.1695,
+     "bleu_greedy": 28.07,
+     "bleu_beam4": 28.87,
+     "wall_s": 4139,
+     "memory_gb": 5.61
+    }
+   },
+   "notes": "LR factor 1 vs 2 at x4: no difference (keep 1.0). x8 best only through 2x tokens; at equal compute (x8 step 5000) val 3.332/BLEU 25.72 vs x4 3.318/26.62. Not converged at 10k steps. Beam4 +0.6-0.8 BLEU. Write-up: 2026-11-28_kaggle_t4_opus100_quality.md"
   }
  ]
 }
