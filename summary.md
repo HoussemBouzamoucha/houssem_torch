@@ -57,8 +57,25 @@ engines' val losses match at every size. ×4 overfits opus_books after step 5000
 Write-ups: `benchmarks/t4/2026-11-27_kaggle_t4_gemm_layouts.md`, `…_lt_epilogues.md`,
 `…_grad_accumulation.md`. On the T4, the engine's speed work is essentially done.
 
-**Next:** training quality: a larger dataset for long big-batch runs, and a
-learning-rate schedule for large effective batches.
+## Training quality (branch `train/quality`, Kaggle T4 run 2026-11-28)
+
+opus-100 fr->en (933k pairs), 10000 optimizer steps, BLEU on the 2000 test
+sentences with our own GPU decoder (KV-cache greedy and beam search):
+
+| run | tokens / step | val loss | BLEU greedy | BLEU beam 4 | wall s | memory GB |
+|---|---:|---:|---:|---:|---:|---:|
+| x4, Noam factor 1 | 5,872 | 3.318 | 26.62 | 27.18 | 2112 | 5.61 |
+| x4, Noam factor 2 | 5,872 | 3.314 | 26.18 | 26.97 | 2108 | 5.61 |
+| x8 (2 x x4 accumulated), factor 2.83 | 11,745 | 3.170 | 28.07 | 28.87 | 4139 | 5.61 |
+
+- Doubling the LR at x4 changes nothing, so the default Noam factor stays 1.0.
+- x8 is the best model, but only because it sees 2x the tokens. At equal
+  compute (x8 at step 5000) it is slightly behind x4 (BLEU 25.72 vs 26.62).
+- No run has converged yet. Beam 4 adds +0.6 to +0.8 BLEU.
+
+Write-up: `benchmarks/t4/2026-11-28_kaggle_t4_opus100_quality.md`.
+
+**Next:** CUDA Graphs for the TrainStep.
 
 ## Known limits
 
