@@ -35,6 +35,8 @@ Val loss (step: val / train):
 Greedy BLEU at step 5000 / 10000: x4 lr1 22.77 / 26.62, x4 lr2 22.78 / 26.18,
 x8 25.72 / 28.07. Greedy decoding of the 2000 test sentences takes 3 s.
 
+![Val loss vs steps, val loss vs training time, test BLEU](2026-11-28_kaggle_t4_opus100_quality.png)
+
 ## Findings
 
 - **LR factor 1 vs 2 at x4: no difference.** Val 3.318 vs 3.314 is noise, and
